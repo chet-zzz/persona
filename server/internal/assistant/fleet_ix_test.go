@@ -594,3 +594,46 @@ func TestResumableAnswerWrittenAsTheGraceEnds(t *testing.T) {
 		t.Fatalf("the hook back got %+v %v", r, err)
 	}
 }
+
+// hubCards are the cards the hub holds after what it was told, kept as fleet_link.go keeps them: a card is added by
+// fleet.interaction and taken off by fleet.interaction_resolved, in the order they came.
+func (ft *fleetTest) hubCards() map[string]bool {
+	ft.f.mu.Lock()
+	defer ft.f.mu.Unlock()
+	cards := map[string]bool{}
+	for _, t := range ft.f.told {
+		switch t.event {
+		case assistantwire.EventFleetInteraction:
+			var p assistantwire.FleetInteraction
+			if json.Unmarshal(t.params, &p) == nil {
+				cards[p.Interaction.ID] = true
+			}
+		case assistantwire.EventFleetResolved:
+			var p assistantwire.FleetResolved
+			if json.Unmarshal(t.params, &p) == nil {
+				delete(cards, p.ID)
+			}
+		}
+	}
+	return cards
+}
+
+// A runtime that withdraws its card while the manager is still telling it leaves no card on the hub. OpenCode's TUI in
+// auto accept answers a permission the moment it is asked, and the plugin then cancels the card it was raising: the
+// cancel ends the card before it reached the apps, and the card told afterwards stayed on the hub for good, "needs
+// you" with nothing to answer (410).
+func TestCardCancelledWhileToldLeavesNoCardOnTheHub(t *testing.T) {
+	ft := newFleetTest(t)
+	ft.st.insertGate = make(chan struct{}) // the card is registered; its history row and the apps wait
+	ix := proto.Interaction{ID: "opencode-1", MachineID: "mac", SessionID: "ses_1", Kind: proto.IxPermission,
+		ToolName: "external_directory", Resumable: true, ExpiresAt: time.Now().Add(time.Hour)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _ = ft.s.waitInteraction(ctx, ix) }()
+	ft.waitPending(1)
+	ft.event("mac", "interaction.cancel", map[string]any{"id": ix.ID})
+	ft.waitPending(0)
+	close(ft.st.insertGate)
+	waitFor(t, "the card told to the hub", func() bool { return len(ft.toldOf(assistantwire.EventFleetInteraction)) > 0 })
+	waitFor(t, "the hub to hold no card", func() bool { return len(ft.hubCards()) == 0 })
+}

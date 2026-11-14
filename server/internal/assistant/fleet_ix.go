@@ -305,9 +305,24 @@ func (s *Service) waitInteraction(ctx context.Context, ix proto.Interaction) (pr
 		s.record(ix)
 		s.announce(ix)
 	}
+	s.endedWhileTold(p)
 	resume := pushMCPInteraction(ctx, ix)
 	defer resume()
 	return s.await(ctx, p)
+}
+
+// endedWhileTold tells the hub again that card p ended when it ended while it was being told. Its node can withdraw it
+// at once (interaction.cancel: OpenCode's TUI in auto accept answers a permission the moment it is asked, and the plugin
+// cancels the card it was raising); finished() then told the hub its end before the card itself reached it, and the
+// hub would keep it pending for good ("needs you", and 410 when answered). One that ends after this check is told
+// ended by finished(), after the card too. A newer card under the same id is left alone.
+func (s *Service) endedWhileTold(p *pending) {
+	s.fleet.mu.Lock()
+	_, held := s.fleet.interactions[p.ix.ID]
+	s.fleet.mu.Unlock()
+	if !held {
+		s.hub.Tell(assistantwire.EventFleetResolved, assistantwire.FleetResolved{ID: p.ix.ID})
+	}
 }
 
 // await blocks on a registered interaction. When ctx ends — the node's connection is gone — a resumable
