@@ -54,6 +54,10 @@ export interface Todo {
   priority?: string;
   /** The slug of the knowledge-base project it belongs to (#2581, docs/assistant/todos.md "Project"); unset for none. */
   project?: string;
+  /** The to-do whose request this one is a piece of, and the pieces it waits for (docs/assistant/todos.md "Requests in
+   *  pieces"); unset for a to-do that is no piece and from hubs without them. */
+  part_of?: string;
+  after?: string[];
   done_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -979,4 +983,19 @@ export function taskNow(lead: Session | undefined, working: boolean): TaskNow | 
 /** What each of an agent's running subagents is for: shown under its own progress, never instead of it. */
 export function runningSubagents(s: Session | undefined): string[] {
   return (s?.subagents ?? []).filter((a) => a.running).map((a) => a.description?.trim() || a.type || t("lib-todos.subtask"));
+}
+
+/** Whether any request is in pieces (docs/assistant/todos.md "Requests in pieces"): a to-do is a piece of another listed
+ *  one, or two to-dos came from one task plan. The To-dos page offers "By request" only then. */
+export function hasRequestPieces(todos: readonly Todo[]): boolean {
+  const ids = new Set(todos.map((t) => t.id));
+  const plans = new Set<string>();
+  for (const t of todos) {
+    if (t.part_of && t.part_of !== t.id && ids.has(t.part_of)) return true;
+    if (t.plan_id) {
+      if (plans.has(t.plan_id)) return true;
+      plans.add(t.plan_id);
+    }
+  }
+  return false;
 }
