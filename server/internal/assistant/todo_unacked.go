@@ -78,19 +78,38 @@ func unackedDecisions(all []db.TodoDecisionRow) []db.TodoDecisionRow {
 
 // waitsOn: decision d of t, one of unackedDecisions, is listed. On a to-do or a task, while it is open and not
 // cancelled (closed, nothing is left to change). On a concern, only its report, and only while that report keeps it
-// closed: latest is the concern's newest report, and its close is at most reportedWait old. An open concern's earlier
-// report is not listed: reopening it said the answer was not enough, and the next report is what will wait.
+// closed: latest is the concern's newest report, and now is not past waitsUntil. An open concern's earlier report is
+// not listed: reopening it said the answer was not enough, and the next report is what will wait.
 func waitsOn(t Todo, d db.TodoDecisionRow, latest string, now time.Time) bool {
 	if !t.isConcern() {
 		return t.DoneAt == nil && !t.Cancelled()
 	}
-	return d.Source == db.DecisionReported && d.ID == latest && t.DoneAt != nil && t.DoneBy == db.DoneByReported &&
-		!t.DoneAt.Before(now.Add(-reportedWait))
+	until := waitsUntil(t)
+	return d.Source == db.DecisionReported && d.ID == latest && t.DoneBy == db.DoneByReported && !until.IsZero() &&
+		!now.After(until)
+}
+
+// waitsUntil is when t's listed decision stops waiting with nothing written: a closed concern's report, reportedWait
+// after the report closed it (listed up to and at that instant). Zero when only a change to t ends the wait (an open
+// to-do's calls). The answer carries it so an open Overview drops the row on time without the to-do changing.
+func waitsUntil(t Todo) time.Time {
+	if !t.isConcern() || t.DoneAt == nil {
+		return time.Time{}
+	}
+	return t.DoneAt.Add(reportedWait)
+}
+
+// unackedDecision is one listed decision as the route answers it: the decision, and waits_until when it stops
+// waiting on its own (waitsUntil).
+type unackedDecision struct {
+	db.TodoDecisionRow
+	WaitsUntil *time.Time `json:"waits_until,omitempty"`
 }
 
 func (s *Service) todoUnackedRoutes() {
 	// GET /api/v1/todos/decisions/unacked: the model's decisions the owner has not acknowledged, newest first, at most
-	// unackedLimit → {"decisions": [Decision]}: on the open to-dos, and the report of each concern it closed (waitsOn).
+	// unackedLimit → {"decisions": [Decision + waits_until]}: on the open to-dos, and the report of each concern it closed
+	// (waitsOn), that one with waits_until (waitsUntil).
 	s.handle("GET /api/v1/todos/decisions/unacked", func(w http.ResponseWriter, r *http.Request) {
 		st := s.todoDB()
 		if st == nil {
@@ -102,6 +121,9 @@ func (s *Service) todoUnackedRoutes() {
 			return
 		}
 		now := time.Now()
+		if s.unackedNow != nil {
+			now = s.unackedNow()
+		}
 		all, err := st.OpenTodoDecisions(r.Context(), now.Add(-reportedWait))
 		if err != nil {
 			apierr.Write(w, http.StatusInternalServerError, err)
@@ -113,12 +135,17 @@ func (s *Service) todoUnackedRoutes() {
 				latest[d.TodoID] = d.ID
 			}
 		}
-		out := []db.TodoDecisionRow{}
+		out := []unackedDecision{}
 		for _, d := range unackedDecisions(all) {
-			if t, ok := s.todoNow(d.TodoID); !ok || !waitsOn(t, d, latest[d.TodoID], now) {
+			t, ok := s.todoNow(d.TodoID)
+			if !ok || !waitsOn(t, d, latest[d.TodoID], now) {
 				continue
 			}
-			if out = append(out, d); len(out) == unackedLimit {
+			item := unackedDecision{TodoDecisionRow: d}
+			if until := waitsUntil(t); !until.IsZero() {
+				item.WaitsUntil = &until
+			}
+			if out = append(out, item); len(out) == unackedLimit {
 				break
 			}
 		}

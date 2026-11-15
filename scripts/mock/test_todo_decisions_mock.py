@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -128,6 +129,14 @@ class UnackedDecisionsMockTests(unittest.TestCase):
         self.assertIn("dec_ag_branch", got)
         self.assertNotIn("dec_ag_font", got, "the owner already replaced it")
         self.assertNotIn("dec_me_font", got, "the owner's own call")
+
+    def test_a_concern_s_report_says_when_it_stops_waiting(self):
+        listed = {d["id"]: d for d in self.hub.request("/api/v1/todos/decisions/unacked")["decisions"]}
+        concern = next(t for t in self.hub.request("/api/v1/todos")["todos"] if t["id"] == "todo_concern_closed")
+        done = datetime.fromisoformat(concern["done_at"].replace("Z", "+00:00"))
+        until = datetime.fromisoformat(listed["dec_concern_report"]["waits_until"].replace("Z", "+00:00"))
+        self.assertEqual(until - done, timedelta(days=7))
+        self.assertNotIn("waits_until", listed["dec_ag_branch"], "an open to-do's call waits until the to-do changes")
 
     def test_i_agree_on_the_report_takes_it_off(self):
         self.hub.request("/api/v1/todos/todo_concern_closed/decisions", "POST", {"question": "Is the nightly backup covered?",

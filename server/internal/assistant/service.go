@@ -109,6 +109,9 @@ type Service struct {
 	superviseTimes superviseTimings
 	// retryNow is the clock a due retry checks the task's time against (retryStillDue; nil: time.Now, tests set it).
 	retryNow func() time.Time
+	// unackedNow is the clock GET /todos/decisions/unacked judges a concern report's wait by (todo_unacked.go; nil:
+	// time.Now, tests set it).
+	unackedNow func() time.Time
 
 	mux    *http.ServeMux
 	routes []string

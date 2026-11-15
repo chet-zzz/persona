@@ -3566,30 +3566,34 @@ def _decision_written(t):
 
 def unacked_decisions_route():
     """GET /api/v1/todos/decisions/unacked, as server/internal/assistant/todo_unacked.go answers it: the model's decisions
-    in effect on open to-dos (no concern), and the newest report of a concern that report closed within 7 days, that no
-    later decision of the owner's on the same question answers, newest first. A hub from before it
-    (`MOCK_LEGACY_HUB`): the route-level 404."""
+    in effect on open to-dos (no concern), and the newest report of a concern that report closed within 7 days (with
+    waits_until, its close plus 7 days), that no later decision of the owner's on the same question answers, newest
+    first. A hub from before it (`MOCK_LEGACY_HUB`): the route-level 404."""
     if os.environ.get("MOCK_LEGACY_HUB"):
         return {"error": "Not Found", "code": "not_found", "retryable": False}, 404
     owners = ("manual", "card", "thread")
     norm = lambda q: " ".join(q.split()).lower()
     open_ids = {t["id"] for t in TODOS if not t.get("done_at") and t.get("kind") != "concern"}
     week = ago(days=7)  # the same form as done_at
-    reported_ids = {t["id"] for t in TODOS if t.get("kind") == "concern" and t.get("done_at")
-                    and t.get("done_by") == "reported" and t["done_at"] >= week}
+    reported = {t["id"]: t for t in TODOS if t.get("kind") == "concern" and t.get("done_at")
+                and t.get("done_by") == "reported" and t["done_at"] >= week}
     latest = {}
     for d in sorted(TODO_DECISIONS, key=lambda d: (d["created_at"], d["id"])):
         if d["source"] == "reported":
             latest[d["todo_id"]] = d["id"]
     out = []
     for d in TODO_DECISIONS:
-        waits = d["todo_id"] in open_ids or d["todo_id"] in reported_ids and latest.get(d["todo_id"]) == d["id"]
+        waits = d["todo_id"] in open_ids or d["todo_id"] in reported and latest.get(d["todo_id"]) == d["id"]
         if not waits or d["source"] in owners or d["superseded_by"]:
             continue
         if any(m["todo_id"] == d["todo_id"] and m["source"] in owners and m["created_at"] >= d["created_at"]
                and norm(m["question"]) and norm(m["question"]) == norm(d["question"]) for m in TODO_DECISIONS):
             continue
-        out.append(copy.deepcopy(d))
+        item = copy.deepcopy(d)
+        if d["todo_id"] in reported:
+            done = datetime.fromisoformat(reported[d["todo_id"]]["done_at"].replace("Z", "+00:00"))
+            item["waits_until"] = (done + timedelta(days=7)).isoformat().replace("+00:00", "Z")
+        out.append(item)
     out.sort(key=lambda d: (d["created_at"], d["id"]), reverse=True)
     return {"decisions": out}, 200
 

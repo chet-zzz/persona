@@ -152,3 +152,70 @@ describe("the unacknowledged decisions group", () => {
     expect(host.innerHTML).toBe("");
   });
 });
+
+// #8557 review: an Overview left open while a reported concern's seven days run out. Its to-do never changes (no
+// updated_at stamp moves), so only the cutoff the manager gave (waits_until) can take the row away; the clock is moved
+// with fake timers, never waited for.
+describe("a concern's report left open past its cutoff", () => {
+  const T0 = Date.UTC(2026, 10, 14, 12, 0, 0);
+  const WEEK = 7 * 24 * 60 * 60 * 1000;
+  const title = "Is the nightly backup covered?";
+  const concern = todo("c1", { title, kind: "concern", done_at: new Date(T0).toISOString(), done_by: "reported" });
+  const reported = { ...decision("r1", "reported", { todo_id: "c1", question: title, choice: "Yes, every night at 2:00" }), waits_until: new Date(T0 + WEEK).toISOString() };
+  const tick = async (ms: number) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+
+  beforeEach(() => vi.useFakeTimers({ now: T0, toFake: ["setTimeout", "clearTimeout", "Date"] }));
+  afterEach(() => vi.useRealTimers());
+
+  it.each<[string, number, boolean, number]>([
+    // name, time after the report closed it, still shown, reads
+    ["a day on", 24 * 60 * 60 * 1000, true, 1],
+    ["a millisecond before the cutoff", WEEK - 1, true, 1],
+    ["exactly at the cutoff", WEEK, true, 1],
+    ["a millisecond past the cutoff", WEEK + 1, false, 2],
+    ["a month on", 30 * 24 * 60 * 60 * 1000, false, 2],
+  ])("%s", async (_name, after, shown, reads) => {
+    hub.todos = [concern];
+    // the manager lists it until its cutoff and not after, as its clock says
+    hub.unacked = [reported];
+    act(() => root.render(<HomeUnacked />));
+    await tick(0);
+    expect(host.querySelector('[data-decision="r1"]')).not.toBeNull();
+    expect(hub.reads).toBe(1);
+    await tick(Math.min(after, WEEK));
+    if (after > WEEK) {
+      hub.unacked = []; // past it, the manager no longer lists it
+      await tick(after - WEEK);
+    }
+    expect(Boolean(host.querySelector('[data-decision="r1"]')), "shown").toBe(shown);
+    expect(hub.reads, "reads").toBe(reads);
+    if (!shown) expect(host.innerHTML).toBe("");
+    // the to-do was never touched: hub.todos is still the one object it started with
+    expect(hub.todos).toEqual([concern]);
+  });
+
+  it("drops the row locally even when the manager, its clock behind, still lists it", async () => {
+    hub.todos = [concern];
+    hub.unacked = [reported];
+    act(() => root.render(<HomeUnacked />));
+    await tick(0);
+    await tick(WEEK + 1);
+    expect(hub.reads).toBe(2);
+    expect(host.querySelector('[data-decision="r1"]')).toBeNull();
+    await tick(WEEK);
+    expect(hub.reads).toBe(2); // no read loop
+  });
+
+  it("leaves no timer behind when the Overview goes", async () => {
+    hub.todos = [concern];
+    hub.unacked = [reported];
+    act(() => root.render(<HomeUnacked />));
+    await tick(0);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    act(() => root.unmount());
+    expect(vi.getTimerCount()).toBe(0);
+    await tick(WEEK + 1);
+    expect(hub.reads).toBe(1);
+    root = createRoot(host); // afterEach unmounts it again
+  });
+});

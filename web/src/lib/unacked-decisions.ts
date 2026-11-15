@@ -4,18 +4,46 @@
 // GET /todos/decisions/unacked; this file only reads it and writes the owner's answers.
 //   - read once when the group mounts, and again (at most every few hundred ms) when a to-do it may list changes: the
 //     hub bumps a to-do's `updated_at` whenever a decision is written, so those to-dos' stamps say when to read;
+//   - a concern's report stops waiting on its own, with nothing written to its to-do (its seven days run out): the route
+//     says when (`waits_until`), and at that instant the row leaves the list here and the list is read once more;
 //   - a manager without the route (its route-level 404) is asked once, and the group then shows nothing.
 import { api } from "./api";
 import { isLegacySpacesRouteError, type Todo, type TodoDecision } from "./todos";
 
 const SETTLE_MS = 400;
+/** The longest a wait for a `waits_until` sleeps before looking at the clock again: a computer asleep or a throttled tab
+ *  can hold a timer past its time, so a row still leaves at most this late (each look is local, never a read). */
+export const EXPIRY_CHECK_MS = 60 * 60 * 1000;
 
-export type UnackedState = { decisions: TodoDecision[]; unsupported: boolean };
+/** One listed decision as the route answers it: `waits_until`, on a concern's report, is the last instant it waits
+ *  (the manager's rule, server/internal/assistant/todo_unacked.go waitsUntil); absent, only a change to its to-do ends it. */
+export type UnackedDecision = TodoDecision & { waits_until?: string };
+
+export type UnackedState = { decisions: UnackedDecision[]; unsupported: boolean };
+
+/** The decisions still waiting at `now` (ms): those past their `waits_until` are gone, as the manager answers. */
+export function stillWaiting(decisions: readonly UnackedDecision[], now: number): UnackedDecision[] {
+  return decisions.filter((d) => !d.waits_until || !(now > Date.parse(d.waits_until)));
+}
+
+/** The first instant (ms) after `now` at which one of the decisions stops waiting, or undefined when none will. */
+export function nextExpiry(decisions: readonly UnackedDecision[], now: number): number | undefined {
+  let next: number | undefined;
+  for (const d of decisions) {
+    const until = d.waits_until ? Date.parse(d.waits_until) : NaN;
+    if (Number.isNaN(until) || until < now) continue;
+    const gone = until + 1; // listed up to and at waits_until, gone just after
+    if (next === undefined || gone < next) next = gone;
+  }
+  return next;
+}
 
 /** Reads the list now and whenever `refresh` is called (coalesced); `onState` hears each read. A failed read keeps the
- *  list it had. */
+ *  list it had. When a listed decision's `waits_until` passes, it drops that row and reads once more (one timer, for
+ *  the earliest). */
 export class UnackedFeed {
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private expiry: ReturnType<typeof setTimeout> | undefined;
   private due = 0;
   private closed = false;
   private reading = false;
@@ -24,7 +52,7 @@ export class UnackedFeed {
 
   constructor(
     private onState: (s: UnackedState) => void,
-    private read: () => Promise<TodoDecision[]> = async () => (await api<{ decisions?: TodoDecision[] }>("/todos/decisions/unacked")).decisions ?? [],
+    private read: () => Promise<UnackedDecision[]> = async () => (await api<{ decisions?: UnackedDecision[] }>("/todos/decisions/unacked")).decisions ?? [],
   ) {}
 
   /** Read again soon (several calls in a row make one read). */
@@ -43,6 +71,8 @@ export class UnackedFeed {
   close() {
     this.closed = true;
     clearTimeout(this.timer);
+    clearTimeout(this.expiry);
+    this.timer = this.expiry = undefined;
   }
 
   private async load() {
@@ -67,8 +97,30 @@ export class UnackedFeed {
   }
 
   private set(s: UnackedState) {
-    this.state = s;
-    this.onState(s);
+    const now = Date.now();
+    this.state = { ...s, decisions: stillWaiting(s.decisions, now) };
+    this.onState(this.state);
+    this.armExpiry(now);
+  }
+
+  /** One timer for the earliest `waits_until` still ahead: then the row goes here at once (set filters it) and the list
+   *  is read again, the manager's word on what else changed. A wait longer than EXPIRY_CHECK_MS looks again then. */
+  private armExpiry(now: number) {
+    clearTimeout(this.expiry);
+    this.expiry = undefined;
+    const next = this.closed ? undefined : nextExpiry(this.state.decisions, now);
+    if (next === undefined) return;
+    this.expiry = setTimeout(() => {
+      this.expiry = undefined;
+      if (this.closed) return;
+      const at = Date.now();
+      if (at < next) return this.armExpiry(at);
+      this.set(this.state);
+      // read in this same turn (a read already set for later is this one)
+      clearTimeout(this.timer);
+      this.timer = undefined;
+      void this.load();
+    }, Math.min(next - now, EXPIRY_CHECK_MS));
   }
 }
 

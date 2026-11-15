@@ -3,6 +3,7 @@ package assistant
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"slices"
 	"testing"
@@ -157,7 +158,8 @@ func TestUnackedDecisionsReportedConcern(t *testing.T) {
 	}
 }
 
-// waitsOn: which of unackedDecisions a to-do lists, a concern's report included, and how long that report waits.
+// waitsOn and waitsUntil: which of unackedDecisions a to-do lists, a concern's report included, how long that report
+// waits, and the instant the answer says it stops (listed at it, gone just after).
 func TestUnackedDecisionsWaitOn(t *testing.T) {
 	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	ago := func(d time.Duration) *time.Time { at := now.Add(-d); return &at }
@@ -166,26 +168,141 @@ func TestUnackedDecisionsWaitOn(t *testing.T) {
 	concern := func(done *time.Time, by string) Todo {
 		return Todo{Kind: db.KindConcern, DoneAt: done, DoneBy: by}
 	}
+	until := func(done *time.Time) time.Time { return done.Add(reportedWait) }
 	for _, c := range []struct {
 		name   string
 		t      Todo
 		d      db.TodoDecisionRow
 		latest string
 		want   bool
+		until  time.Time // zero: the wait ends only with a change to the to-do
 	}{
-		{"an open to-do", Todo{}, agent, "", true},
-		{"a closed to-do", Todo{DoneAt: ago(time.Minute)}, agent, "", false},
-		{"a cancelled to-do", Todo{DoneAt: ago(time.Minute), DoneBy: db.DoneByCancelled}, agent, "", false},
-		{"a concern closed by its report", concern(ago(time.Hour), db.DoneByReported), report, "rep", true},
-		{"its report on the last day", concern(ago(reportedWait), db.DoneByReported), report, "rep", true},
-		{"its report a week and more ago", concern(ago(reportedWait+time.Minute), db.DoneByReported), report, "rep", false},
-		{"an earlier report of it", concern(ago(time.Hour), db.DoneByReported), report, "rep2", false},
-		{"a reopened concern's report", concern(nil, ""), report, "rep", false},
-		{"another decision on a concern", concern(ago(time.Hour), db.DoneByReported), agent, "rep", false},
-		{"another decision on an open concern", concern(nil, ""), agent, "", false},
+		{"an open to-do", Todo{}, agent, "", true, time.Time{}},
+		{"a closed to-do", Todo{DoneAt: ago(time.Minute)}, agent, "", false, time.Time{}},
+		{"a cancelled to-do", Todo{DoneAt: ago(time.Minute), DoneBy: db.DoneByCancelled}, agent, "", false, time.Time{}},
+		{"a concern its report just closed", concern(ago(0), db.DoneByReported), report, "rep", true, until(ago(0))},
+		{"a concern closed by its report", concern(ago(time.Hour), db.DoneByReported), report, "rep", true, until(ago(time.Hour))},
+		{"its report a nanosecond before the cutoff", concern(ago(reportedWait-time.Nanosecond), db.DoneByReported), report, "rep", true, until(ago(reportedWait - time.Nanosecond))},
+		{"its report exactly at the cutoff", concern(ago(reportedWait), db.DoneByReported), report, "rep", true, now},
+		{"its report a nanosecond past the cutoff", concern(ago(reportedWait+time.Nanosecond), db.DoneByReported), report, "rep", false, now.Add(-time.Nanosecond)},
+		{"its report a week and more ago", concern(ago(reportedWait+time.Minute), db.DoneByReported), report, "rep", false, now.Add(-time.Minute)},
+		{"an earlier report of it", concern(ago(time.Hour), db.DoneByReported), report, "rep2", false, until(ago(time.Hour))},
+		{"a reopened concern's report", concern(nil, ""), report, "rep", false, time.Time{}},
+		{"a concern closed by hand, not its report", concern(ago(time.Hour), ""), report, "rep", false, until(ago(time.Hour))},
+		{"another decision on a concern", concern(ago(time.Hour), db.DoneByReported), agent, "rep", false, until(ago(time.Hour))},
+		{"another decision on an open concern", concern(nil, ""), agent, "", false, time.Time{}},
 	} {
 		if got := waitsOn(c.t, c.d, c.latest, now); got != c.want {
 			t.Errorf("%s: waits %v, want %v", c.name, got, c.want)
 		}
+		if got := waitsUntil(c.t); !got.Equal(c.until) {
+			t.Errorf("%s: waits until %v, want %v", c.name, got, c.until)
+		}
+	}
+}
+
+// unackedList is GET /api/v1/todos/decisions/unacked as the apps read it, waits_until included.
+func unackedList(e *todoEnv) []unackedDecision {
+	e.t.Helper()
+	var res struct{ Decisions []unackedDecision }
+	if err := json.Unmarshal(e.must("GET", "/api/v1/todos/decisions/unacked", "").Body.Bytes(), &res); err != nil {
+		e.t.Fatal(err)
+	}
+	return res.Decisions
+}
+
+// #8557 review: a reported concern leaves the list when its seven days run out, with nothing written to the to-do,
+// and the answer says when beforehand (waits_until) so an open Overview can drop it on time. The route's clock is moved
+// (Service.unackedNow), never waited for; two concerns reported one after the other expire in that order, while an open
+// to-do's call (no waits_until) stays throughout.
+func TestUnackedDecisionsReportedConcernExpires(t *testing.T) {
+	e := newConcernEnv(t)
+	ctx := context.Background()
+	clock := time.Now()
+	e.s.unackedNow = func() time.Time { return clock }
+	concern := func(title, text string) (*Todo, string) {
+		t.Helper()
+		before := map[string]bool{}
+		for _, td := range e.list() {
+			before[td.ID] = true
+		}
+		if _, err := e.tool("todo_create", map[string]any{"title": title, "kind": "concern"}); err != nil {
+			t.Fatal(err)
+		}
+		var id string
+		for _, td := range e.list() {
+			if !before[td.ID] {
+				id = td.ID
+			}
+		}
+		if _, err := e.tool("concern_report", map[string]any{"id": id, "report": text}); err != nil {
+			t.Fatal(err)
+		}
+		ds, err := e.s.todoDB().ListTodoDecisions(ctx, id, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := e.get(id)
+		if got == nil || got.DoneAt == nil || got.DoneBy != db.DoneByReported {
+			t.Fatalf("the report did not close %s: %+v", id, got)
+		}
+		return got, ds[len(ds)-1].ID
+	}
+	open := e.create("Fix the widget")
+	first, firstRep := concern("Will the release slip", "It will not slip")
+	second, secondRep := concern("Is the backup covered", "Yes, nightly")
+	if !second.DoneAt.After(*first.DoneAt) {
+		t.Fatalf("the reports closed at %v and %v: the second is not later", first.DoneAt, second.DoneAt)
+	}
+	if _, err := e.s.todoDB().InsertTodoDecision(ctx, db.TodoDecisionRow{ID: "dec_open", TodoID: open.ID, Question: "Which branch?",
+		Choice: "A", Source: db.DecisionAgent, CreatedAt: first.DoneAt.Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	firstEnd, secondEnd := first.DoneAt.Add(reportedWait), second.DoneAt.Add(reportedWait)
+	stamps := func() map[string]time.Time {
+		out := map[string]time.Time{}
+		for _, id := range []string{first.ID, second.ID, open.ID} {
+			out[id] = e.get(id).UpdatedAt
+		}
+		return out
+	}
+	unchanged := stamps()
+
+	for _, step := range []struct {
+		name string
+		at   time.Time
+		want []string // ids, newest first
+	}{
+		{"just reported", second.DoneAt.Add(time.Minute), []string{secondRep, firstRep, "dec_open"}},
+		{"a day on", second.DoneAt.Add(24 * time.Hour), []string{secondRep, firstRep, "dec_open"}},
+		{"a nanosecond before the first's cutoff", firstEnd.Add(-time.Nanosecond), []string{secondRep, firstRep, "dec_open"}},
+		{"exactly at the first's cutoff", firstEnd, []string{secondRep, firstRep, "dec_open"}},
+		{"a nanosecond past the first's cutoff", firstEnd.Add(time.Nanosecond), []string{secondRep, "dec_open"}},
+		{"exactly at the second's cutoff", secondEnd, []string{secondRep, "dec_open"}},
+		{"a nanosecond past the second's cutoff", secondEnd.Add(time.Nanosecond), []string{"dec_open"}},
+		{"a month on", secondEnd.Add(30 * 24 * time.Hour), []string{"dec_open"}},
+	} {
+		clock = step.at
+		var ids []string
+		for _, d := range unackedList(e.todoEnv) {
+			ids = append(ids, d.ID)
+			var want *time.Time
+			switch d.ID {
+			case firstRep:
+				want = &firstEnd
+			case secondRep:
+				want = &secondEnd
+			}
+			if (d.WaitsUntil == nil) != (want == nil) || want != nil && !d.WaitsUntil.Equal(*want) {
+				t.Errorf("%s: %s waits until %v, want %v", step.name, d.ID, d.WaitsUntil, want)
+			}
+		}
+		if !slices.Equal(ids, step.want) {
+			t.Errorf("%s: listed %v, want %v", step.name, ids, step.want)
+		}
+	}
+	// the to-dos were never touched: only the clock moved
+	if now := stamps(); !maps.EqualFunc(now, unchanged, time.Time.Equal) {
+		t.Fatalf("a to-do changed: %v, was %v", now, unchanged)
 	}
 }
