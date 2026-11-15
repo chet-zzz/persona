@@ -1,8 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
-  buildGraph, CARD_H, CARD_W, layoutRequest, lineage, pieceStep, queuedRows, requestWords, roundedPath, type GraphData, type GraphRequest,
+  buildGraph, CARD_H, CARD_W, layoutRequest, lineage, mergesWithRoot, pieceStep, queuedRows, requestWords, roundedPath, type GraphData, type GraphNode, type GraphRequest,
 } from "./request-graph";
+import { caseKey, caseName, caseTodos, MERGE_CASES, PIECES, ROOTS, type PieceKind, type RootKind } from "./request-graph-merge-cases";
 import type { PlanTask, TaskPlan } from "./feed";
 import { makeSessionLookup, todoStatus, type Todo } from "./todos";
 import type { Session } from "./types";
@@ -177,6 +178,67 @@ describe("a request of one piece that says the same", () => {
     expect([find("todo:closed").done, find("todo:closed").merged]).toEqual([false, false]);
     // both done: one card again
     expect([find("todo:both").done, find("todo:both").merged]).toEqual([true, true]);
+  });
+
+  it("keeps the root's card for an open root whose same-name piece the hub closed and nobody looked at yet", () => {
+    // stored closed (done_at, done_by auto) but drawn `review`: an open root and an unseen auto-done piece still split
+    const g = graph([todo("req", { title: "Search" }), todo("piece", { title: "Search", part_of: "req", done_at: at(5), done_by: "auto", done_reason: "finished" })]);
+    const req = g.active.find((r) => r.key === "todo:req")!;
+    expect([Boolean(req), req.done, node(req, "piece").state, req.merged]).toEqual([true, false, "review", false]);
+    expect(req.edges.map((e) => `${e.from}>${e.to}`)).toEqual(["root>todo:piece"]);
+  });
+});
+
+describe("root × piece: when one card stands for both", () => {
+  const cases = MERGE_CASES.map((c) => ({ ...c, name: caseName(c) }));
+
+  it("covers every root and every piece", () => {
+    const seen = new Set(MERGE_CASES.map(caseKey));
+    for (const r of Object.keys(ROOTS)) for (const p of Object.keys(PIECES)) expect(seen.has(caseKey({ root: r as RootKind, piece: p as PieceKind })), `${r} × ${p}`).toBe(true);
+    expect(seen.size).toBe(MERGE_CASES.length);
+  });
+
+  it.each(cases)("$name", (c) => {
+    const { todos, sessions } = caseTodos(c, at, todo);
+    const g = graph(todos, sessions);
+    const req = [...g.active, ...g.done].find((r) => r.key === `todo:r-${caseKey(c)}`)!;
+    expect(req.kind).toBe("parent");
+    expect({ state: node(req, `p-${caseKey(c)}`).state, merged: req.merged, done: req.done, filed: g.done.includes(req) ? "done" : "active" })
+      .toEqual({ state: c.state, merged: c.merged, done: c.done, filed: c.done ? "done" : "active" });
+    // a merged block has no connectors; a split one has the root's
+    expect(req.edges.map((e) => e.from)).toEqual(c.merged ? [] : ["root"]);
+    // never a done-looking card standing for an open request
+    if (req.merged && !req.done) expect(req.nodes[0].state).not.toBe("done");
+  });
+
+  it("the same, all in one graph: each request's answer is its own", () => {
+    const all = MERGE_CASES.map((c) => caseTodos(c, at, todo));
+    const g = graph(all.flatMap((x) => x.todos), all.flatMap((x) => x.sessions));
+    for (const c of MERGE_CASES) {
+      const req = [...g.active, ...g.done].find((r) => r.key === `todo:r-${caseKey(c)}`)!;
+      expect([req.merged, req.done], caseName(c)).toEqual([c.merged, c.done]);
+    }
+  });
+
+  it("merges a request with no root to-do by its words alone: a lone to-do in any state, an open plan's one task", () => {
+    for (const kind of Object.keys(PIECES) as PieceKind[]) {
+      const lone = todo(`solo-${kind}`, { title: "Rename", ...PIECES[kind].patch(at) });
+      const lg = graph([lone], (PIECES[kind] as { sessions?: (a: typeof at) => Session[] }).sessions?.(at) ?? []);
+      const r = [...lg.active, ...lg.done][0];
+      expect([r.kind, r.merged], kind).toEqual(["single", true]);
+    }
+    const r = graph([], [], { p: plan("p", "open", [task("Rename", { brief: { request: { text: "Rename", at: at(0) } } as PlanTask["brief"] })]) }).active[0];
+    expect([r.kind, r.nodes[0].todo, r.nodes[0].state, r.merged]).toEqual(["plan", undefined, "queued", true]);
+  });
+
+  it("answers mergesWithRoot from the stored state, and the drawn one only for a plan's task with no to-do", () => {
+    const n = (patch: Partial<GraphNode>): GraphNode => ({ key: "k", title: "t", layer: 1, row: 0, after: [], waitsFor: [], waitsStart: false, state: "ready", agents: [], ask: "", ...patch });
+    // a task with no to-do: its drawn state is all there is
+    expect([mergesWithRoot(todo("r"), n({ state: "queued" })), mergesWithRoot(todo("r", { done_at: at(1) }), n({ state: "done" }))]).toEqual([true, true]);
+    expect(mergesWithRoot(todo("r"), n({ state: "done" }))).toBe(false);
+    // a to-do's stored state wins over what it is drawn as
+    expect(mergesWithRoot(todo("r"), n({ state: "review", todo: todo("p", { done_at: at(1), done_by: "auto" }) }))).toBe(false);
+    expect(mergesWithRoot(todo("r", { done_at: at(1) }), n({ state: "review", todo: todo("p", { done_at: at(1), done_by: "auto" }) }))).toBe(true);
   });
 });
 

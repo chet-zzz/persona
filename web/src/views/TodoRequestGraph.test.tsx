@@ -11,6 +11,7 @@ vi.hoisted(() => {
 });
 import { initI18n } from "../i18n";
 import type { TaskPlan } from "../lib/feed";
+import { caseKey, caseName, caseTodos, MERGE_CASES, type MergeCase } from "../lib/request-graph-merge-cases";
 import { makeSessionLookup, type Todo } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
 import TodoRequestGraph from "./TodoRequestGraph";
@@ -181,6 +182,56 @@ describe("a request of one piece, and nothing queued", () => {
     expect(block.querySelectorAll("[data-edge]").length).toBe(1);
     act(() => rootCard.click());
     expect(opened).toEqual(["req"]);
+  });
+
+  it("keeps the root's card for an open request whose same-name piece the hub closed and nobody looked at yet", () => {
+    const opened: string[] = [];
+    act(() => root.render(
+      <TodoRequestGraph todos={[todo("req", { title: "Search page" }), todo("piece", { title: "Search page", part_of: "req", done_at: at(10), done_by: "auto", done_reason: "finished" })]}
+        lookup={makeSessionLookup([])} machines={machines} onOpenTodo={(id) => opened.push(id)} />,
+    ));
+    const block = host.querySelector('[data-request="todo:req"]')!;
+    expect(block).not.toBeNull(); // among the open requests
+    expect(block.querySelector('[data-node="todo:piece"]')!.textContent).toContain("Awaiting review");
+    expect(block.querySelector("[data-node-request]")).toBeNull();
+    const rootCard = block.querySelector<HTMLButtonElement>("[data-root]")!;
+    expect(rootCard).not.toBeNull();
+    act(() => rootCard.click());
+    expect(opened).toEqual(["req"]);
+  });
+
+  it("draws one card or both for every root × piece, open requests in the graph and finished ones under Done", () => {
+    const all = MERGE_CASES.map((c) => caseTodos(c, at, todo));
+    const opened: string[] = [];
+    act(() => root.render(
+      <TodoRequestGraph todos={all.flatMap((x) => x.todos)} lookup={makeSessionLookup(all.flatMap((x) => x.sessions))} machines={machines} onOpenTodo={(id) => opened.push(id)} />,
+    ));
+    const fold = host.querySelector<HTMLButtonElement>("[data-graph-done] > button")!;
+    act(() => fold.click());
+    const check = (c: MergeCase, block: Element) => {
+      const k = caseKey(c);
+      const rootCard = block.querySelector<HTMLButtonElement>("[data-root]");
+      const pieceCard = block.querySelector<HTMLButtonElement>(`[data-node="todo:p-${k}"]`);
+      expect({ rootCard: Boolean(rootCard), mergedLabel: Boolean(block.querySelector("[data-node-request]")), pieceCard: Boolean(pieceCard), edges: block.querySelectorAll("[data-edge]").length }, caseName(c))
+        .toEqual({ rootCard: !c.merged, mergedLabel: c.merged, pieceCard: true, edges: c.merged ? 0 : 1 });
+      // whatever is drawn opens what it stands for: the root card the request's to-do, the piece's card the piece
+      opened.length = 0;
+      if (rootCard) act(() => rootCard.click());
+      act(() => pieceCard!.click());
+      expect(opened, caseName(c)).toEqual(c.merged ? [`p-${k}`] : [`r-${k}`, `p-${k}`]);
+    };
+    for (const c of MERGE_CASES) {
+      const k = caseKey(c);
+      const block = host.querySelector(`[data-request="todo:r-${k}"]`);
+      const active = block && !block.closest("[data-graph-done]") ? block : null;
+      const row = host.querySelector(`[data-done-request="todo:r-${k}"]`);
+      expect({ active: Boolean(active), done: Boolean(row) }, caseName(c)).toEqual({ active: !c.done, done: c.done });
+      if (active) check(c, active);
+      else {
+        act(() => row!.querySelector<HTMLButtonElement>("button")!.click());
+        check(c, row!.querySelector("[data-request]") ?? row!);
+      }
+    }
   });
 
   it("draws no queued strip when nothing is queued", () => {

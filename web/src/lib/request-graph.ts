@@ -104,8 +104,8 @@ export interface GraphRequest {
   touched: number;
   /** When its last piece closed (ms), for a done request. */
   finished: number;
-  /** One piece whose title is the request's words, done exactly when the request's own to-do is: drawn as that piece's
-   * card alone (with when it was said). */
+  /** One piece whose title is the request's words, closed exactly when the request's own to-do is (mergesWithRoot):
+   * drawn as that piece's card alone (with when it was said). */
   merged: boolean;
 }
 
@@ -371,10 +371,25 @@ function finish(req: Omit<GraphRequest, "edges" | "layers" | "rows" | "done" | "
   const done = req.nodes.length > 0 && req.nodes.every((n) => n.state === "done") && (!req.root || isDoneTodo(req.root));
   const touched = Math.max(0, ms(req.plan?.created_at) ?? 0, ...todos.map((t) => ms(t.updated_at) ?? ms(t.created_at) ?? 0));
   const finished = Math.max(0, ...todos.map((t) => ms(t.done_at) ?? 0));
-  // merged only while the root and its piece agree on done: the merged card stands for both and opens the piece, so a
-  // root still open behind a done piece (or done before it) keeps its own card, to be opened, completed or reopened
-  const merged = req.nodes.length === 1 && sameWords(req.words, req.nodes[0].title) && (!req.root || isDoneTodo(req.root) === (req.nodes[0].state === "done"));
+  const merged = req.nodes.length === 1 && sameWords(req.words, req.nodes[0].title) && (!req.root || mergesWithRoot(req.root, req.nodes[0]));
   return { ...req, edges: merged ? [] : edges, layers, rows, done, touched, finished, merged };
+}
+
+/**
+ * Whether a request's one same-name piece may stand for its root to-do alone. The merged card opens the piece, so the
+ * root's own card may go only when the root has nothing to say apart from it:
+ *   1. both are closed or both open as stored (isDoneTodo), never as drawn: a piece the hub closed and the owner has
+ *      not looked at is drawn `review` but is closed, a piece accepted and then reopened with nothing running is drawn
+ *      `done` but is open, a failed start is closed with `start_error` but not done; a plan's task has no to-do yet, so
+ *      its drawn state is all there is;
+ *   2. a card drawn `done` never stands for a root still open: that request is among the open ones, and its root card
+ *      is where it is completed.
+ * Either one split keeps both cards (request-graph.test.ts "root × piece").
+ */
+export function mergesWithRoot(root: Todo, piece: GraphNode): boolean {
+  const rootDone = isDoneTodo(root);
+  const pieceDone = piece.todo ? isDoneTodo(piece.todo) : piece.state === "done";
+  return rootDone === pieceDone && (rootDone || piece.state !== "done");
 }
 
 const rank = (r: GraphRequest) => Math.min(STATE_RANK.done + 1, ...r.nodes.map((n) => STATE_RANK[n.state]));
