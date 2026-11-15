@@ -1059,6 +1059,12 @@ Provider responses carry only the description and `has_key`, never secrets. Defa
                 // the done judge found the latest stretch of work stopped on a decision only the owner can make (#1277,
                 // docs/assistant/unified-entry.md "Supervision"); absent when that does not hold. While it is there the task is not accepted.
                 "waits":{"work":"... (when the stretch began)","at":"...","reason":"the judge's reason"},
+                // only while state is pending_review (additive): when the task entered it (RFC 3339). Set on the way in, kept by every later write
+                // while the review waits (a criterion's report, a new supervisor), absent in every other state. Clients list a review younger than
+                // one hour with the tasks in progress, as its supervisor's to do, and an older one under Needs you
+                // (docs/assistant/unified-entry.md "Needs you and In progress: each thing once (#3387)"); with the field absent (an older hub, or a
+                // review that began before the hub kept the time) they keep the task under Needs you. updated_at is not a stand-in: other writes move it
+                "pending_since":"...",
                 "updated_at":"..."},
  // The task's brief (#3822, docs/assistant/unified-entry.md "Briefs"): what was asked when the work was handed out, never rewritten; absent on a to-do with none.
  // Clients that don't know it show the to-do as usual.
@@ -4970,3 +4976,14 @@ gets 501 `assistant_service_tier_manager_outdated` before relaying an explicit o
 Resumed sends and non-Codex starts return coded 409 refusals; a native refusal returns
 `assistant_service_tier_refused`, stops the unused new process and persists no conversation before the first turn.
 New Agent starts do not take a speed setting.
+
+### Optional Todo repository metadata
+
+The manager relays `GET /api/v1/todos/{id}/repositories` with `todos.read`, and
+`PUT /api/v1/todos/{id}/repositories` plus
+`PUT /api/v1/todos/{id}/repositories/{repo_id}/links` with `todos.write`.
+Routing uses the Todo owner, including explicit-manager conflicts, just like
+existing Todo detail routes. `POST /api/v1/todos` accepts optional atomic
+`repository_bindings`; omitted fields preserve all legacy creation behavior.
+The full request, revision and source-snapshot contract is in
+`docs/assistant/todos.md` ("Repository associations").

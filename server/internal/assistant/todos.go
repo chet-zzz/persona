@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nwverse/persona/server/internal/apierr"
+	"github.com/nwverse/persona/server/internal/assistant/repository"
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/proto"
@@ -546,16 +547,16 @@ func (s *Service) newTodoAs(ctx context.Context, id, title, notes, origin, planI
 }
 
 // insertTodo stores todo row, puts it in memory and tells the apps.
-func (s *Service) insertTodo(ctx context.Context, row db.TodoRow) (Todo, error) {
+func (s *Service) insertTodo(ctx context.Context, row db.TodoRow, bindings ...*repository.CreateBindings) (Todo, error) {
 	if err := s.ensureTodosLoaded(ctx); err != nil {
 		return Todo{}, err
 	}
 	var out Todo
 	var err error
 	if row.PartOf != "" || len(row.After) > 0 {
-		out, err = s.insertPiece(ctx, row)
+		out, err = s.insertPiece(ctx, row, bindings...)
 	} else {
-		out, err = s.putNewTodo(ctx, row)
+		out, err = s.putNewTodo(ctx, row, bindings...)
 	}
 	if err != nil {
 		return Todo{}, err
@@ -566,7 +567,7 @@ func (s *Service) insertTodo(ctx context.Context, row db.TodoRow) (Todo, error) 
 
 // insertPiece is putNewTodo for a piece of a request: its links checked again and the row stored with todoBook.writing
 // held, as editTodo writes them (todo_pieces.go).
-func (s *Service) insertPiece(ctx context.Context, row db.TodoRow) (Todo, error) {
+func (s *Service) insertPiece(ctx context.Context, row db.TodoRow, bindings ...*repository.CreateBindings) (Todo, error) {
 	if f := s.pieceWriteHook; f != nil {
 		f(row.ID)
 	}
@@ -577,12 +578,20 @@ func (s *Service) insertPiece(ctx context.Context, row db.TodoRow) (Todo, error)
 		return Todo{}, err
 	}
 	row.PartOf, row.After = *e.PartOf, *e.After
-	return s.putNewTodo(ctx, row)
+	return s.putNewTodo(ctx, row, bindings...)
 }
 
 // putNewTodo is insertTodo's store write and memory, without telling anyone.
-func (s *Service) putNewTodo(ctx context.Context, row db.TodoRow) (Todo, error) {
-	if st := s.todoDB(); st != nil {
+func (s *Service) putNewTodo(ctx context.Context, row db.TodoRow, bindings ...*repository.CreateBindings) (Todo, error) {
+	if len(bindings) > 0 && bindings[0] != nil {
+		st, ok := s.store().(todoRepositoryStore)
+		if !ok {
+			return Todo{}, repository.Problem("store_unavailable")
+		}
+		if err := st.CreateTodoWithRepositories(ctx, row, *bindings[0]); err != nil {
+			return Todo{}, err
+		}
+	} else if st := s.todoDB(); st != nil {
 		if err := st.CreateTodo(ctx, row); err != nil {
 			return Todo{}, err
 		}
@@ -849,6 +858,7 @@ func (s *Service) closedTaskOf(ctx context.Context, mid, sid string) (Todo, bool
 var errTodosUnavailable = errors.New("todos service unavailable")
 
 func (s *Service) todoRoutes() {
+	s.todoRepositoryRoutes()
 	s.taskReviewDismissalRoutes()
 	s.todoDecisionRoutes()
 	s.todoThreadRoutes()
@@ -903,10 +913,11 @@ func (s *Service) todoRoutes() {
 			return
 		}
 		var in struct {
-			Title   string  `json:"title"`
-			Notes   string  `json:"notes"`
-			Project *string `json:"project"`
-			Kind    string  `json:"kind"`
+			Title              string          `json:"title"`
+			Notes              string          `json:"notes"`
+			Project            *string         `json:"project"`
+			Kind               string          `json:"kind"`
+			RepositoryBindings json.RawMessage `json:"repository_bindings"`
 			todoPlanIn
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -932,11 +943,20 @@ func (s *Service) todoRoutes() {
 			apierr.Write(w, http.StatusBadRequest, err)
 			return
 		}
+		bindings, err := parseCreateBindings(in.RepositoryBindings)
+		if err != nil {
+			taskRepositoriesError(w, err)
+			return
+		}
 		var resTodo Todo
 		if kind == db.KindConcern {
-			resTodo, err = s.createConcern(r.Context(), title, strings.TrimSpace(in.Notes), plan)
+			resTodo, err = s.createConcern(r.Context(), title, strings.TrimSpace(in.Notes), plan, bindings)
 		} else {
-			resTodo, err = s.createPlainTodo(r.Context(), title, in.Notes, plan)
+			resTodo, err = s.createPlainTodo(r.Context(), title, in.Notes, plan, bindings)
+		}
+		if bindings != nil && err != nil {
+			taskRepositoriesError(w, err)
+			return
 		}
 		if errors.Is(err, errConcernNoStore) {
 			apierr.Write(w, http.StatusServiceUnavailable, err)
