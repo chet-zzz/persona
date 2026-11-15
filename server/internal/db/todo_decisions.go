@@ -77,6 +77,32 @@ func (d *DB) ListTodoDecisions(ctx context.Context, todoID string, all bool) ([]
 	return out, rows.Err()
 }
 
+// OpenTodoDecisions returns every decision of the to-dos still open, superseded ones included (with superseded_by),
+// oldest first: what the Overview's "Decided for you, not acknowledged" is worked out from (assistant/todo_unacked.go).
+func (d *DB) OpenTodoDecisions(ctx context.Context) ([]TodoDecisionRow, error) {
+	rows, err := d.pool.Query(ctx, `SELECT d.id, d.todo_id, d.question, d.choice, d.reason, d.source, d.source_machine,
+			d.source_session, d.source_message, COALESCE(d.supersedes_id, ''),
+			COALESCE((SELECT n.id FROM todo_decisions n WHERE n.supersedes_id = d.id ORDER BY n.created_at DESC, n.id DESC LIMIT 1), ''),
+			d.created_at
+		FROM todo_decisions d JOIN todos t ON t.id = d.todo_id
+		WHERE t.done_at IS NULL
+		ORDER BY d.created_at, d.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TodoDecisionRow{}
+	for rows.Next() {
+		var r TodoDecisionRow
+		if err := rows.Scan(&r.ID, &r.TodoID, &r.Question, &r.Choice, &r.Reason, &r.Source, &r.SourceMachine,
+			&r.SourceSession, &r.SourceMessage, &r.SupersedesID, &r.SupersededBy, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // TodoDecisionsSince returns the decisions in effect of every todo written at or after since, oldest first: what the
 // owner answered lately, counted when a standing rule is suggested (assistant/rule_suggest.go, #4929).
 func (d *DB) TodoDecisionsSince(ctx context.Context, since time.Time) ([]TodoDecisionRow, error) {

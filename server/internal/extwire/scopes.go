@@ -103,6 +103,7 @@ var RouteScopes = map[string]string{
 	// a retry stay with full credentials.
 	"GET /api/v1/todos":                                 ScopeTodosRead,
 	"GET /api/v1/todos/{id}/decisions":                  ScopeTodosRead,
+	"GET /api/v1/todos/decisions/unacked":               ScopeTodosRead,
 	"POST /api/v1/todos":                                ScopeTodosWrite,
 	"PATCH /api/v1/todos/{id}":                          ScopeTodosWrite,
 	"POST /api/v1/todos/{id}/decisions":                 ScopeTodosWrite,

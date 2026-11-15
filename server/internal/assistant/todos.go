@@ -146,6 +146,7 @@ type todoStore interface {
 	UnlinkTodoAgent(ctx context.Context, todoID, machineID, sessionID string) error
 	UpdateTodoAgentSnapshot(ctx context.Context, machineID, sessionID, title, startError string) error
 	ListTodoDecisions(ctx context.Context, todoID string, all bool) ([]db.TodoDecisionRow, error)
+	OpenTodoDecisions(ctx context.Context) ([]db.TodoDecisionRow, error)
 	InsertTodoDecision(ctx context.Context, r db.TodoDecisionRow) (bool, error)
 	SetTodoDecisionSupersedes(ctx context.Context, todoID, id, supersedesID string, at time.Time) (*db.TodoDecisionRow, error)
 	ReportConcern(ctx context.Context, r db.TodoDecisionRow, reason string) (*db.TodoRow, bool, error)
@@ -810,6 +811,7 @@ var errTodosUnavailable = errors.New("todos service unavailable")
 func (s *Service) todoRoutes() {
 	s.taskReviewDismissalRoutes()
 	s.todoDecisionRoutes()
+	s.todoUnackedRoutes()
 	s.todoThreadRoutes()
 	s.todoSeenRoutes()
 	s.todoRetitleRoute()
