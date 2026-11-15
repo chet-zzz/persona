@@ -1,0 +1,19 @@
+{
+  "title": "Decided for you, not acknowledged",
+  "origin_its": "Its call",
+  "chose": "Chose: ",
+  "because": "Why: {reason}",
+  "source_agent": "Noted by the Agent",
+  "source_outcome": "Taken from its final reply",
+  "source_reported": "What the main conversation told you",
+  "ack": "I agree",
+  "ack_all": "Agree with all on this to-do",
+  "overrule": "No, change it",
+  "overrule_choice": "Change it to",
+  "overrule_reason": "Why (optional)",
+  "overrule_save": "Note my decision",
+  "cancel": "Cancel",
+  "failed": "Not noted: {error}",
+  "more_unacked_one": "{count} more",
+  "more_unacked_other": "{count} more"
+}

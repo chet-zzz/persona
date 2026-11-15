@@ -699,6 +699,7 @@ To-do details No Agent currently (#1110): `MOCK_TODO_OFFLINE=1` adds backup proj
 To-do details Decisions (#1618): the mock always serves `GET/POST /api/v1/todos/{id}/decisions` and `PATCH …/decisions/{did}` as the hub does (every to-do empty: the empty state).
 `MOCK_TODO_DECISIONS=1` gives Weather App 1.3 release a decision answered in an Agent's question, one revised and the one that revised it; `-openSession macbook/a1f3c2d4-0000-4000-8000-000000000002 -openTodoDetail YES -showDecisionHistory YES`
 opens it with the revised one shown struck through; `-openSession studio/a1f3c2d4-0000-4000-8000-000000000003 -openTodoDetail YES` opens the blog to-do (none recorded).
+`MOCK_AGENT_DECISIONS=1` (with `MOCK_TASKS=1`) gives the widget fix four of its Agent's decisions and one of the user's that replaced a fifth, and the tests task an outcome: the Overview's "Decided for you, not acknowledged" group (`docs/web/web.md` "Overview").
 Record / Revise / the row's ⋯ write into the mock (the to-do's `updated_at` moves, `todos` is pushed); `MOCK_LEGACY_HUB=1` answers the route-level 404 and the section is hidden. `python3 -I scripts/mock/test_todo_decisions_mock.py` checks the routes.
 
 Port forwarding (`PortForwardTests`, `docs/operations/ports.md`): `:<port>` badges in chat header/replies include page titles; stopped gray. Open loads mock's page through

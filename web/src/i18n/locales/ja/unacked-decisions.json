@@ -1,0 +1,18 @@
+{
+  "title": "エージェントの判断（未承認）",
+  "origin_its": "エージェントの判断",
+  "chose": "選択：",
+  "because": "理由：{reason}",
+  "source_agent": "エージェントが記録",
+  "source_outcome": "最後の返信から抽出した結論",
+  "source_reported": "メイン会話が伝えた結果",
+  "ack": "承認",
+  "ack_all": "この ToDo の判断をすべて承認",
+  "overrule": "違う、変更する",
+  "overrule_choice": "変更後の内容",
+  "overrule_reason": "理由（任意）",
+  "overrule_save": "自分の決定として記録",
+  "cancel": "キャンセル",
+  "failed": "記録できませんでした：{error}",
+  "more_unacked_other": "ほか {count} 件"
+}

@@ -1,5 +1,5 @@
 // Overview: what needs you, what is running, what just finished — Beautiful UI's Task Rows — and the computers.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { SESSIONS_HIERARCHY_FEATURE } from "../lib/child-sessions";
 import { homeKey } from "../lib/folded-rows";
 import { ago, interactionCanAnswer, sessionCan, sessionPreview, shortDuration, sourceSubtitle, sessionTitle, stateOf, tabLabel } from "../lib/format";
@@ -38,10 +38,15 @@ import { Icon } from "../ui/icons";
 import { MarkSeenDialog } from "./AgentMenus";
 import { answeredLookup, answeredSessions } from "./assistant/answered-lookup";
 import { resolve } from "./chat/Interactions";
+import { whenIdle } from "../ui/stream/idle";
 import { OverviewCards } from "./extensions/ExtensionSlots";
 import { TodoStageBar } from "./TodoStageBar";
 import { t } from "../i18n";
 import { markAllSeenLabel, STATE_LABEL, stateCount, stateName } from "../lib/state-labels";
+
+// The calls the Agents made that the user has not acknowledged: its code and its one read of them come
+// once the page has painted, and it draws nothing while there is nothing to acknowledge.
+const HomeUnacked = lazy(() => import("./HomeUnacked"));
 
 function greeting() {
   const h = new Date().getHours();
@@ -96,6 +101,8 @@ export function Home({ onNewAgent, onToggleSidebar }: { onNewAgent: () => void; 
   const tasks = useMemo(() => homeTasks(todos, answeredLookup(withTaskRows(makeSessionLookup(agentSessions), taskRows), interactions, answered)), [todos, agentSessions, taskRows, interactions, answered]);
   const name = (mid: string) => machineWithHub(mid, machines);
   const [confirmSeen, setConfirmSeen] = useState<Session[] | null>(null);
+  const [painted, setPainted] = useState(false);
+  useEffect(() => whenIdle(() => setPainted(true)), []);
   const markAll = <MarkAllSeen count={unread.length} onClick={() => setConfirmSeen(unread)} />;
 
   // A card answered on its row (#4090) stays in its slot while it is sent and, answered, says so for a moment before
@@ -191,6 +198,8 @@ export function Home({ onNewAgent, onToggleSidebar }: { onNewAgent: () => void; 
               })}
             </Group>
           )}
+
+          {loaded && painted && <Suspense fallback={null}><HomeUnacked /></Suspense>}
 
           {loaded && groups.needs.length > 0 && (
             <Group title={t("home.waiting_on_computer")} count={groups.needs.length} hint={t("home.waiting_on_computer_hint")} grid>
@@ -308,7 +317,7 @@ const GRID = {
   cards: "grid grid-cols-1 items-start gap-1.5 @min-[84rem]:grid-cols-2 @min-[120rem]:grid-cols-3",
 };
 
-function Group({ title, count, children, right, hint, grid }: { title: string; count: number; children: React.ReactNode; right?: React.ReactNode; hint?: string; grid?: true | "cards" }) {
+export function Group({ title, count, children, right, hint, grid }: { title: string; count: number; children: React.ReactNode; right?: React.ReactNode; hint?: string; grid?: true | "cards" }) {
   return (
     <section>
       <div className={cx("flex items-baseline gap-2", hint ? "mb-1" : "mb-2.5")}>

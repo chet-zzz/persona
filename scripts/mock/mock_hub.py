@@ -3528,13 +3528,56 @@ if os.environ.get("MOCK_TODO_CONCERNS") in ("1", "only"):
     TODO_DECISIONS.append(todo_decision(
         "dec_concern_report", "todo_concern_closed", "Is the nightly backup covered?",
         "The nightly backup is already covered.", source="reported", at=ago(minutes=15)))
+# `MOCK_AGENT_DECISIONS=1` (with MOCK_TASKS=1, web/src/views/HomeUnacked.tsx): the calls the Agents made on the
+# tasks, nobody's acknowledgment yet. The widget fix has four of the Agent's (todo_decision_add) and one the user wrote,
+# which replaced an earlier one of the Agent's; the tests task has an outcome taken from its Agent's last reply.
+if os.environ.get("MOCK_AGENT_DECISIONS"):
+    TODO_DECISIONS += [
+        todo_decision("dec_ag_layout", "todo_task_widget", "横屏时小组件怎么排？", "两列，温度在左", "竖屏的一列在横屏下太空",
+                      source="agent", machine="macbook", session=WIDGET, at=ago(minutes=40)),
+        todo_decision("dec_ag_test", "todo_task_widget", "回归测试用快照还是截图？", "快照测试", "截图在不同机型上会抖",
+                      source="agent", machine="macbook", session=WIDGET, at=ago(minutes=35)),
+        todo_decision("dec_ag_scope", "todo_task_widget", "顺手修不修竖屏的溢出？", "一起修", "同一处布局代码，分开修要改两次",
+                      source="agent", machine="macbook", session=WIDGET, at=ago(minutes=30)),
+        todo_decision("dec_ag_branch", "todo_task_widget", "改动放在哪个分支？", "fix/widget-landscape", "",
+                      source="agent", machine="macbook", session=WIDGET, at=ago(minutes=28)),
+        todo_decision("dec_ag_font", "todo_task_widget", "字号跟系统设置走吗？", "固定 13", "设计稿写死了",
+                      source="agent", machine="macbook", session=WIDGET, at=ago(minutes=26)),
+        todo_decision("dec_me_font", "todo_task_widget", "字号跟系统设置走吗？", "跟系统走", "辅助功能要用到",
+                      supersedes="dec_ag_font", at=ago(minutes=20)),
+        todo_decision("dec_out_tests", "todo_task_tests", "网络层的超时重试放在哪一层？", "请求层统一重试三次",
+                      "从它最后的回复里取出的结论", source="outcome", machine="macbook", session=TESTS, at=ago(minutes=12)),
+    ]
 _mark_superseded("todo_weather")
+for _tid in ("todo_task_widget", "todo_task_tests"):
+    _mark_superseded(_tid)
 TODO_DECISIONS_INIT = copy.deepcopy(TODO_DECISIONS)
 
 
 def _decision_written(t):
     t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     push_todos()
+
+
+def unacked_decisions_route():
+    """GET /api/v1/todos/decisions/unacked, as server/internal/assistant/todo_unacked.go answers it: the model's decisions
+    in effect on open to-dos (no concern) that no later decision of the owner's on the same question answers, newest
+    first. A hub from before it (`MOCK_LEGACY_HUB`): the route-level 404."""
+    if os.environ.get("MOCK_LEGACY_HUB"):
+        return {"error": "Not Found", "code": "not_found", "retryable": False}, 404
+    owners = ("manual", "card", "thread")
+    norm = lambda q: " ".join(q.split()).lower()
+    open_ids = {t["id"] for t in TODOS if not t.get("done_at") and t.get("kind") != "concern"}
+    out = []
+    for d in TODO_DECISIONS:
+        if d["todo_id"] not in open_ids or d["source"] in owners or d["superseded_by"]:
+            continue
+        if any(m["todo_id"] == d["todo_id"] and m["source"] in owners and m["created_at"] >= d["created_at"]
+               and norm(m["question"]) and norm(m["question"]) == norm(d["question"]) for m in TODO_DECISIONS):
+            continue
+        out.append(copy.deepcopy(d))
+    out.sort(key=lambda d: (d["created_at"], d["id"]), reverse=True)
+    return {"decisions": out}, 200
 
 
 def todo_decisions_route(command, tid, did, query, body):
@@ -25222,6 +25265,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/v1/sessions": return self.send_json(*paged_sessions(q))
         if tasks_area(self, "GET", p, None): return
         if p == "/api/v1/todos": return self.send_json({"todos": sorted_todos()})
+        if p == "/api/v1/todos/decisions/unacked": return self.send_json(*unacked_decisions_route())
         if p.startswith("/api/v1/todos/") and p.endswith("/decisions") and p.count("/") == 5:
             return self.send_json(*todo_decisions_route("GET", unquote(p.split("/")[4]), None, q, {}))
         if p.startswith("/api/v1/todos/") and p.count("/") == 4:

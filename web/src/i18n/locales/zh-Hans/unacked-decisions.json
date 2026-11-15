@@ -1,0 +1,18 @@
+{
+  "title": "它定的，你还没认",
+  "origin_its": "它定的",
+  "chose": "选了：",
+  "because": "理由：{reason}",
+  "source_agent": "Agent 自己记下的",
+  "source_outcome": "从结束时的回复里取出的结论",
+  "source_reported": "主对话告诉你的结果",
+  "ack": "认了",
+  "ack_all": "这条待办下的全认了",
+  "overrule": "不对，要改",
+  "overrule_choice": "改成什么",
+  "overrule_reason": "为什么（可不填）",
+  "overrule_save": "记下我的决定",
+  "cancel": "取消",
+  "failed": "没记下：{error}",
+  "more_unacked_other": "还有 {count} 条"
+}
