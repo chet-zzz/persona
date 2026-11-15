@@ -325,16 +325,21 @@ const CONVERSATION = /^\/assistant\/conversations\/[^/?]+/;
 // The routes that are the current assistant's as a whole: its page, conversations, scheduled tasks and memory
 // (`/assistant…`), and its knowledge base with the recordings it keeps there.
 const CURRENT = /^\/(?:assistant|kb|kb-search|recordings)(?=$|[/?])/;
+// The collections of the current assistant's to-dos one manager answers (the hub merges `/todos` itself, not these): the
+// decisions made for you on them (views/HomeUnacked.tsx), which the page matches against that assistant's to-dos.
+const CURRENT_TODOS = /^\/todos\/decisions\/unacked(?=$|\?)/;
 
 /** The header value for a request to path (under /api/v1), or undefined.
  *  - One conversation's routes name its manager when a page listed it, else none: the hub then sends them to the
  *    conversation's manager itself (ownership.go byConversation), and naming the page's pick would override that.
  *  - The assistant's other routes and its knowledge base name the current assistant, but not the health space's
- *    (`?space=`, docs/assistant/health.md: that page stays the default manager's).
+ *    (`?space=`, docs/assistant/health.md: that page stays the default manager's); so do the collections of its to-dos
+ *    one manager answers (CURRENT_TODOS).
  *  - Anything else: a pin or a thing a merged list showed as another manager's names that one. */
 export function managerHeaderFor(path: string): string | undefined {
   if (CONVERSATION.test(path)) return itemManager(path);
   if (chosen && CURRENT.test(path) && !/[?&]space=/.test(path)) return chosen;
+  if (chosen && CURRENT_TODOS.test(path)) return chosen;
   return itemManager(path);
 }
 

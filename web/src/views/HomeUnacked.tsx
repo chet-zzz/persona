@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { formatDate, t } from "../i18n";
 import { errorText } from "../lib/api";
 import { useScopedTodos } from "../lib/current-assistant";
+import { useChosenManager } from "../lib/manager-choice";
 import { href, onLinkClick, type Route } from "../lib/router";
 import { addTodoDecision, type Todo, type TodoDecision } from "../lib/todos";
 import { ackBody, groupByTodo, listsUnacked, overruleBody, UNACKED_FIRST, UnackedFeed, type UnackedState } from "../lib/unacked-decisions";
@@ -27,14 +28,18 @@ interface UnackedGroup {
 /** The groups to show, the to-do with the latest call first, and the feed to read again after a write. */
 function useUnacked(): { feed: UnackedFeed | null; groups: UnackedGroup[] } {
   const todos = useScopedTodos();
+  // the list is the current assistant's (its request names it, lib/manager-choice.ts): another one picked is another
+  // list, read afresh, and whether its manager has the route is asked again
+  const manager = useChosenManager();
   const [state, setState] = useState<UnackedState>({ decisions: [], unsupported: false });
   const [feed, setFeed] = useState<UnackedFeed | null>(null);
   useEffect(() => {
     const made = new UnackedFeed(setState);
+    setState({ decisions: [], unsupported: false });
     setFeed(made);
     made.refresh(true);
     return () => made.close();
-  }, []);
+  }, [manager]);
   // a decision written anywhere moves its to-do's updated_at: the stamps of the to-dos it may list say when to read again
   const stamp = useMemo(() => todos.filter(listsUnacked).map((td) => td.id + "@" + td.updated_at).join(","), [todos]);
   const seen = useRef(stamp);
