@@ -2,9 +2,11 @@
 // small DAG drawn left to right: the owner's words, then each piece of work in layers by what it waits for (thin
 // connectors with a hollow dot where they leave a card; dashed into a piece still queued). A piece says where it stands
 // and which Agent is on it; hovering or focusing it lights it, what it waits for and what waits for it, and dims the
-// rest. A piece with a to-do opens that to-do on the page, as a row does. Finished requests fold to one line each under
-// "Done"; the pieces still queued are listed under the graph. Everything is the hub's own data.
-import { useMemo, useState, type CSSProperties } from "react";
+// rest. A piece with a to-do opens that to-do on the page, as a row does. A piece with more than one Agent grows its
+// Agent tree under its card (the leader, the workers it handed out, what they spawned and their subagents, ended ones
+// grey with a check), each line opening its Agent. Finished requests fold to one line each under "Done"; the pieces
+// still queued are listed under the graph. Everything is the hub's own data.
+import { useCallback, useMemo, useState, type CSSProperties } from "react";
 import { t } from "../i18n";
 import { agentName, sessionAgent } from "../lib/agent-kind";
 import { useDirectionTree } from "../lib/direction-tree";
@@ -12,17 +14,20 @@ import { useFeed } from "../lib/feed";
 import { clock, sessionTitle, shortDuration } from "../lib/format";
 import { machineWithHub } from "../lib/mesh";
 import {
-  buildGraph, CARD_H, CARD_W, layoutRequest, lineage, MERGED_H, queuedRows,
-  type GraphNode, type GraphRequest, type NodeAgent, type NodeState, type QueueRow,
+  buildGraph, CARD_H, CARD_W, layoutRequest, lineage, MERGED_H, queuedRows, roundedPath, TREE_HEAD_H, TREE_MORE_H, TREE_PAD, TREE_ROW_H, treeHeight,
+  type GraphNode, type GraphRequest, type NodeAgent, type NodeState, type QueueRow, type TreeRow,
 } from "../lib/request-graph";
+import { navigate } from "../lib/router";
 import { effortLabel } from "../lib/routines";
 import { modelLabel } from "../lib/session-models";
-import { stateName } from "../lib/state-labels";
-import type { SessionLookup, Todo } from "../lib/todos";
+import { useFullAgentSessions } from "../lib/sessions";
+import { stateCount, stateName } from "../lib/state-labels";
+import { makeSessionLookup, type SessionLookup, type Todo } from "../lib/todos";
 import type { Machine } from "../lib/types";
 import { AgentMark } from "../ui/AgentMark";
 import { Button, cx, useNow } from "../ui/atoms";
 import { Icon } from "../ui/icons";
+import { StatusMark } from "../ui/StatusMark";
 import { tipHandlers, useTips, type TipApi } from "./TodoRequestGraphTip";
 
 /** The connectors' tones, from the theme's own: a line between the soft line color and the muted ink, and a fainter
@@ -110,16 +115,43 @@ function detail(n: GraphNode, req: GraphRequest, now: number): string {
 
 // ── the view ────────────────────────────────────────────────
 
-export default function TodoRequestGraph({ todos, lookup, machines, selectedId, onOpenTodo }: {
+/** Opens an Agent's session as its own page (a subagent's: the session that launched it). */
+const openSession = (mid: string, sid: string) => navigate({ name: "session", mid, sid });
+
+/** What every request block shares: the hover cards, which trees are folded, and where a tree's line goes. */
+interface Shared {
+  machines: Machine[];
+  now: number;
+  selectedId?: string;
+  tips: TipApi;
+  folded: ReadonlySet<string>;
+  onFold: (key: string) => void;
+  onOpenTodo: (id: string) => void;
+  onOpenAgent: (mid: string, sid: string) => void;
+}
+
+export default function TodoRequestGraph({ todos, lookup, machines, selectedId, onOpenTodo, onOpenAgent = openSession }: {
   todos: readonly Todo[]; lookup: SessionLookup; machines: Machine[]; selectedId?: string; onOpenTodo: (id: string) => void;
+  onOpenAgent?: (mid: string, sid: string) => void;
 }) {
   const plans = useFeed((s) => s.plans);
   const tree = useDirectionTree();
   const now = useNow(TICK_MS);
-  const graph = useMemo(() => buildGraph({ todos, plans, data: { tree, todos, lookup } }), [todos, plans, tree, lookup]);
+  // a list's summary rows leave out a session's subagents (running and ended): the complete rows have them
+  const full = useFullAgentSessions();
+  const complete = useMemo(() => makeSessionLookup(full.sessions), [full.sessions]);
+  const graph = useMemo(() => buildGraph({ todos, plans, data: { tree, todos, lookup, complete } }), [todos, plans, tree, lookup, complete]);
   const queue = useMemo(() => queuedRows(graph), [graph]);
   const [hot, setHot] = useState<Hot>(null);
+  // the Agent trees folded to their first line (every tree starts open)
+  const [folded, setFolded] = useState<ReadonlySet<string>>(() => new Set());
+  const onFold = useCallback((key: string) => setFolded((was) => {
+    const next = new Set(was);
+    if (!next.delete(key)) next.add(key);
+    return next;
+  }), []);
   const tips = useTips();
+  const shared: Shared = { machines, now, selectedId, tips: tips.api, folded, onFold, onOpenTodo, onOpenAgent };
   return (
     <section aria-label={t("request-graph.label")} className="@container flex min-h-0 flex-1 flex-col" data-graph="" style={EDGE_TONES}>
       <div className="min-h-0 min-w-0 flex-1 overflow-auto overscroll-contain" data-graph-zone="">
@@ -127,10 +159,10 @@ export default function TodoRequestGraph({ todos, lookup, machines, selectedId, 
         <div className="w-max min-w-full">
           {graph.active.length === 0 && graph.done.length === 0 ? <Empty /> : graph.active.length === 0 ? <AllDone /> : null}
           {graph.active.map((req) => (
-            <RequestBlock key={req.key} req={req} machines={machines} now={now} selectedId={selectedId} hot={hot?.req === req.key ? hot.key : null} tips={tips.api}
-              onHot={(key) => setHot(key ? { req: req.key, key } : null)} onOpenTodo={onOpenTodo} />
+            <RequestBlock key={req.key} req={req} shared={shared} hot={hot?.req === req.key ? hot.key : null}
+              onHot={(key) => setHot(key ? { req: req.key, key } : null)} />
           ))}
-          {graph.done.length > 0 && <DoneFold done={graph.done} machines={machines} now={now} selectedId={selectedId} tips={tips.api} hot={hot} onHot={setHot} onOpenTodo={onOpenTodo} />}
+          {graph.done.length > 0 && <DoneFold done={graph.done} shared={shared} hot={hot} onHot={setHot} />}
         </div>
       </div>
       <QueuedStrip rows={queue} selectedId={selectedId} onHot={setHot} onOpenTodo={onOpenTodo} />
@@ -160,11 +192,11 @@ function AllDone() {
 
 // ── one request ─────────────────────────────────────────────
 
-function RequestBlock({ req, machines, now, selectedId, hot, tips, onHot, onOpenTodo, flat }: {
-  req: GraphRequest; machines: Machine[]; now: number; selectedId?: string; hot: string | null; tips: TipApi; onHot: (key: string | null) => void;
-  onOpenTodo: (id: string) => void; flat?: boolean;
+function RequestBlock({ req, shared, hot, onHot, flat }: {
+  req: GraphRequest; shared: Shared; hot: string | null; onHot: (key: string | null) => void; flat?: boolean;
 }) {
-  const lay = useMemo(() => layoutRequest(req), [req]);
+  const { folded, selectedId, tips, onOpenTodo } = shared;
+  const lay = useMemo(() => layoutRequest(req, (n) => treeHeight(n.tree, !folded.has(n.key))), [req, folded]);
   const lit = useMemo(() => (hot && hot !== "root" ? lineage(req, hot) : null), [req, hot]);
   // edges in the lit lineage are drawn last, over the dimmed ones
   const edges = lit ? [...lay.edges].sort((a, b) => Number(lit.has(a.from) && lit.has(a.to)) - Number(lit.has(b.from) && lit.has(b.to))) : lay.edges;
@@ -196,24 +228,33 @@ function RequestBlock({ req, machines, now, selectedId, hot, tips, onHot, onOpen
         {!req.merged && <RootCard req={req} at={lay.root} selected={Boolean(req.root) && req.root!.id === selectedId} tips={tips} onOpenTodo={onOpenTodo} onHot={onHot} />}
         {req.nodes.map((n) => {
           const p = lay.nodes.get(n.key)!;
-          return <NodeCard key={n.key} node={n} req={req} x={p.x} y={p.y} machines={machines} now={now} dim={Boolean(lit) && !lit!.has(n.key)} lit={hot === n.key}
-            selected={Boolean(n.todo) && n.todo!.id === selectedId} tips={tips} onHot={onHot} onOpenTodo={onOpenTodo} />;
+          return <NodeCard key={n.key} node={n} req={req} at={p} shared={shared} dim={Boolean(lit) && !lit!.has(n.key)} lit={hot === n.key}
+            selected={Boolean(n.todo) && n.todo!.id === selectedId} onHot={onHot} />;
         })}
       </div>
     </div>
   );
 }
 
-/** The root's label: the owner's words, or the title they were filed under. */
+/** The root's label: the owner's words when they are the heading, else "Request" (the sentence the work was filed under). */
 const rootLabel = (req: GraphRequest) => (req.own ? t("request-graph.root_words") : t("request-graph.root_title"));
 
-function RootCard({ req, at, selected, tips, onOpenTodo, onHot }: { req: GraphRequest; at: { x: number; y: number }; selected: boolean; tips: TipApi; onOpenTodo: (id: string) => void; onHot: (key: string | null) => void }) {
+/** The owner's words quoted under a heading that says something else. */
+const quoteLine = (req: GraphRequest) => t("request-graph.root_quote", { words: req.quote });
+
+function RootCard({ req, at, selected, tips, onOpenTodo, onHot }: { req: GraphRequest; at: { x: number; y: number; h: number }; selected: boolean; tips: TipApi; onOpenTodo: (id: string) => void; onHot: (key: string | null) => void }) {
   const done = req.nodes.filter((n) => n.state === "done").length;
   const label = rootLabel(req);
   const th = tipHandlers(tips, () => (
     <>
       <p className="text-xs text-tooltip-muted">{label}{req.at ? ` · ${clock(req.at)}` : ""}</p>
-      <p className="break-words whitespace-pre-line">{req.words}</p>
+      <p className="break-words whitespace-pre-line">{req.title}</p>
+      {req.quote && (
+        <div>
+          <p className="text-xs text-tooltip-muted">{t("request-graph.root_words")}</p>
+          <p className="text-xs break-words whitespace-pre-line">{req.quote}</p>
+        </div>
+      )}
       {req.root && <p className="border-t border-tooltip-border pt-1 text-xs text-tooltip-muted">{t("request-graph.tip_open_todo")}</p>}
     </>
   ));
@@ -224,7 +265,8 @@ function RootCard({ req, at, selected, tips, onOpenTodo, onHot }: { req: GraphRe
         <span className="min-w-0 flex-1 truncate">{label}</span>
         {req.at && <span className="shrink-0 tabular-nums">{clock(req.at)}</span>}
       </span>
-      <span className="mt-1.5 line-clamp-2 max-h-8 shrink-0 overflow-hidden text-xs leading-4 break-words text-ink" data-root-words="">{req.words}</span>
+      <span className="mt-1.5 line-clamp-2 max-h-8 shrink-0 overflow-hidden text-xs leading-4 break-words text-ink" data-root-words="">{req.title}</span>
+      {req.quote && <span className="mt-1 h-4 shrink-0 truncate text-xs leading-4 text-ink-3" data-root-quote="">{quoteLine(req)}</span>}
       <span className="mt-auto flex h-4 items-center gap-1.5 text-xs leading-4 text-ink-3 tabular-nums">
         {req.nodes.length > 1 && <Progress done={done} total={req.nodes.length} />}
         <span className="truncate">{req.nodes.length > 1 ? t("request-graph.progress", { done, total: req.nodes.length }) : t("request-graph.pieces", { count: req.nodes.length })}</span>
@@ -232,7 +274,7 @@ function RootCard({ req, at, selected, tips, onOpenTodo, onHot }: { req: GraphRe
     </>
   );
   const cls = cx("absolute flex flex-col overflow-hidden rounded-control bg-canvas px-2.5 py-2 text-left", selected && "ring-2 ring-accent");
-  const style = { left: at.x, top: at.y, width: CARD_W, height: CARD_H };
+  const style = { left: at.x, top: at.y, width: CARD_W, height: at.h };
   if (req.root) {
     const id = req.root.id;
     return (
@@ -254,38 +296,44 @@ function Progress({ done, total }: { done: number; total: number }) {
   );
 }
 
-function NodeCard({ node, req, x, y, machines, now, dim, lit, selected, tips, onHot, onOpenTodo }: {
-  node: GraphNode; req: GraphRequest; x: number; y: number; machines: Machine[]; now: number; dim: boolean; lit: boolean; selected: boolean; tips: TipApi;
-  onHot: (key: string | null) => void; onOpenTodo: (id: string) => void;
+function NodeCard({ node, req, at, shared, dim, lit, selected, onHot }: {
+  node: GraphNode; req: GraphRequest; at: { x: number; y: number; h: number }; shared: Shared; dim: boolean; lit: boolean; selected: boolean;
+  onHot: (key: string | null) => void;
 }) {
+  const { machines, now, tips, onOpenTodo } = shared;
   const line = detail(node, req, now);
   const current = node.agents.filter((a) => a.role !== "before");
   const lead = current[0];
   const queued = node.state === "queued";
+  const grown = node.tree.length > 0;
+  const headH = req.merged ? MERGED_H : CARD_H;
   const th = tipHandlers(tips, () => <NodeTip node={node} req={req} machines={machines} now={now} />);
-  const shared = {
+  // the card's own look; with an Agent tree it is the box that holds the head and the tree
+  const chrome = cx(
+    "rounded-control transition-[opacity,box-shadow,background-color] duration-150",
+    queued ? "border border-dashed border-line-strong bg-surface" : "bg-surface shadow-card",
+    node.state === "needs_you" && "shadow-[inset_2px_0_0_var(--status-needs),var(--shadow-card)]",
+    (lit || selected) && "ring-2 ring-accent",
+    dim && "opacity-40",
+    node.state === "done" && !dim && "opacity-75",
+  );
+  const head = {
     "data-node": node.key, "data-state": node.state, "data-lit": lit ? "" : undefined, "data-dim": dim ? "" : undefined,
-    style: { left: x, top: y, width: CARD_W, height: req.merged ? MERGED_H : CARD_H } as CSSProperties,
-    onPointerEnter: (e: React.PointerEvent<Element>) => { th.onPointerEnter(e); onHot(node.key); },
-    onPointerLeave: (e: React.PointerEvent<Element>) => { th.onPointerLeave(e); onHot(null); },
-    className: cx(
-      "absolute flex flex-col overflow-hidden rounded-control px-2.5 py-2 text-left transition-[opacity,box-shadow,background-color] duration-150 focus-visible:outline-none",
-      queued ? "border border-dashed border-line-strong bg-surface" : "bg-surface shadow-card",
-      node.todo && "hover:bg-hover",
-      node.state === "needs_you" && "shadow-[inset_2px_0_0_var(--status-needs),var(--shadow-card)]",
-      (lit || selected) && "ring-2 ring-accent",
-      "focus-visible:ring-2 focus-visible:ring-accent",
-      dim && "opacity-40",
-      node.state === "done" && !dim && "opacity-75",
-    ),
+    style: (grown ? { height: headH } : { left: at.x, top: at.y, width: CARD_W, height: headH }) as CSSProperties,
+    onPointerEnter: (e: React.PointerEvent<Element>) => { th.onPointerEnter(e); if (!grown) onHot(node.key); },
+    onPointerLeave: (e: React.PointerEvent<Element>) => { th.onPointerLeave(e); if (!grown) onHot(null); },
+    className: grown
+      ? cx("relative flex w-full shrink-0 flex-col px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset", node.todo && "hover:bg-hover")
+      : cx("absolute flex flex-col overflow-hidden px-2.5 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent", chrome, node.todo && "hover:bg-hover"),
   };
   const body = (
     <>
       {req.merged && (
-        // the request and the piece say the same: one card, with what the root card would have said of when
+        // the request and the piece say the same: one card, with what the root card would have said of when (and the
+        // owner's words when they said something else)
         <span className="mb-1 flex h-4 min-w-0 items-center gap-1.5 text-xs leading-4 text-ink-3" data-node-request="">
           <Icon name={req.kind === "plan" ? "spark" : "quote"} size={11} className="shrink-0" />
-          <span className="min-w-0 flex-1 truncate">{rootLabel(req)}</span>
+          <span className="min-w-0 flex-1 truncate" data-root-quote={req.quote ? "" : undefined}>{req.quote ? quoteLine(req) : rootLabel(req)}</span>
           {req.at && <span className="shrink-0 tabular-nums">{clock(req.at)}</span>}
         </span>
       )}
@@ -299,7 +347,8 @@ function NodeCard({ node, req, x, y, machines, now, dim, lit, selected, tips, on
       <span className="mt-auto flex h-5 min-w-0 items-center gap-1.5 text-xs leading-4 text-ink-3" data-node-agent={lead ? lead.key : ""}>
         {lead ? (
           <>
-            <Marks agents={current} />
+            {/* with a tree under the card, every Agent has its own line there: the head keeps the first one's mark */}
+            <Marks agents={grown ? [lead] : current} />
             <span className="min-w-0 flex-1 truncate">{agentLine(lead, machines)}</span>
           </>
         ) : node.task ? (
@@ -314,13 +363,20 @@ function NodeCard({ node, req, x, y, machines, now, dim, lit, selected, tips, on
     </>
   );
   // a task of a plan not started yet has no to-do to open: a card with its hover card only
-  if (!node.todo) return <div {...shared}>{body}</div>;
-  const id = node.todo.id;
-  return (
-    <button type="button" {...shared} aria-current={selected || undefined} onClick={() => onOpenTodo(id)}
+  const card = !node.todo ? <div {...head}>{body}</div> : (
+    <button type="button" {...head} aria-current={selected || undefined} onClick={() => onOpenTodo(node.todo!.id)}
       onPointerDown={th.onPointerDown} onFocus={(e) => { th.onFocus(e); onHot(node.key); }} onBlur={(e) => { th.onBlur(e); onHot(null); }}>
       {body}
     </button>
+  );
+  if (!grown) return card;
+  // the card grows its Agent tree under its head: pointing anywhere on it lights the piece
+  return (
+    <div className={cx("absolute flex flex-col overflow-hidden", chrome)} style={{ left: at.x, top: at.y, width: CARD_W, height: at.h }} data-node-card={node.key}
+      onPointerEnter={() => onHot(node.key)} onPointerLeave={() => onHot(null)}>
+      {card}
+      <AgentTree node={node} open={!shared.folded.has(node.key)} onFold={() => shared.onFold(node.key)} onOpenAgent={shared.onOpenAgent} />
+    </div>
   );
 }
 
@@ -337,6 +393,102 @@ function Marks({ agents }: { agents: NodeAgent[] }) {
       ))}
       {more > 0 && <span className="-ml-1 flex h-4 min-w-4 items-center justify-center rounded-chip bg-field px-1 text-xs leading-4 font-medium text-ink-2 tabular-nums shadow-hairline">+{more}</span>}
     </span>
+  );
+}
+
+// ── a piece's Agent tree ────────────────────────────────────
+
+/** The tree's geometry inside the card, in px: the card's side padding, how far each level steps in, the mark's size,
+ *  and where a line's mark sits (the middle of its first text line). Levels past MAX_INDENT step in no further. */
+const TREE_X = 10;
+const TREE_STEP = 14;
+const MARK = 16;
+const MARK_MID = 9;
+const MAX_INDENT = 3;
+const indentOf = (depth: number) => TREE_X + Math.min(depth, MAX_INDENT) * TREE_STEP;
+const rowH = (r: TreeRow) => (r.kind === "more" ? TREE_MORE_H : TREE_ROW_H);
+
+/** The connectors from each line to the one it hangs under: down the parent's mark column, a rounded turn, into the
+ *  line's mark, drawn as the graph's own connectors are. */
+function treeEdges(rows: readonly TreeRow[]): string[] {
+  const tops: number[] = [];
+  rows.reduce((y, r) => (tops.push(y), y + rowH(r)), 0);
+  const at = new Map(rows.map((r, i) => [r.key, i]));
+  const out: string[] = [];
+  rows.forEach((r, i) => {
+    const parent = r.kind === "agent" ? r.agent.parent : r.parent;
+    const p = parent === undefined ? undefined : at.get(parent);
+    if (p === undefined) return;
+    const x = indentOf(rows[p].depth) + MARK / 2;
+    const x2 = indentOf(r.depth);
+    const y = tops[i] + (r.kind === "more" ? TREE_MORE_H / 2 : MARK_MID);
+    if (x2 <= x) return; // past the deepest indent: the line sits right under its parent
+    out.push(roundedPath([[x, tops[p] + MARK_MID + MARK / 2], [x, y], [x2 - 2, y]]));
+  });
+  return out;
+}
+
+/** A state's word on a tree line: ended, before, or the Agent's own state. */
+function treeState(a: NodeAgent): string {
+  if (a.role === "before") return t("request-graph.agent_before");
+  if (a.ended) return t("request-graph.agent_ended");
+  return a.state ? stateName(a.state) : "";
+}
+
+function AgentTree({ node, open, onFold, onOpenAgent }: { node: GraphNode; open: boolean; onFold: () => void; onOpenAgent: (mid: string, sid: string) => void }) {
+  const rows = node.tree;
+  const working = node.agents.filter((a) => !a.ended && a.state === "working").length;
+  const paths = useMemo(() => treeEdges(rows), [rows]);
+  const height = rows.reduce((h, r) => h + rowH(r), 0);
+  return (
+    <div className="shrink-0" data-agent-tree={node.key} data-open={open ? "" : undefined}>
+      <button type="button" aria-expanded={open} onClick={onFold} style={{ height: TREE_HEAD_H }}
+        className="flex w-full min-w-0 items-center gap-1.5 border-t border-line px-2.5 text-left text-xs leading-4 text-ink-3 transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset">
+        <Icon name="chevronRight" size={12} className={cx("shrink-0 transition-transform", open && "rotate-90")} />
+        <span className="min-w-0 flex-1 truncate" data-tree-count={node.agents.length}>
+          {[t("request-graph.tree_agents", { count: node.agents.length }), working ? stateCount("working", working) : ""].filter(Boolean).join(" · ")}
+        </span>
+      </button>
+      {open && (
+        <ul className="relative" style={{ paddingBottom: TREE_PAD }}>
+          <svg width={CARD_W} height={height} className="pointer-events-none absolute top-0 left-0 block overflow-visible" aria-hidden data-tree-edges="">
+            {paths.map((d, i) => <path key={i} d={d} fill="none" strokeWidth={1.25} strokeLinecap="round" style={{ stroke: "var(--edge)" }} />)}
+          </svg>
+          {rows.map((r) => (r.kind === "more" ? (
+            <li key={r.key} className="relative flex items-center text-xs leading-4 text-ink-3" style={{ height: TREE_MORE_H, paddingLeft: indentOf(r.depth) + MARK + 6 }} data-tree-more={r.count}>
+              {t("request-graph.tree_more", { count: r.count })}
+            </li>
+          ) : (
+            <TreeLine key={r.key} agent={r.agent} depth={r.depth} onOpenAgent={onOpenAgent} />
+          )))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function TreeLine({ agent: a, depth, onOpenAgent }: { agent: NodeAgent; depth: number; onOpenAgent: (mid: string, sid: string) => void }) {
+  const name = (a.session && sessionTitle(a.session)) || a.title || (a.subagent ? t("request-graph.subagent") : t("request-graph.agent_untitled"));
+  const state = treeState(a);
+  return (
+    <li className="relative" style={{ height: TREE_ROW_H }}>
+      <button type="button" onClick={() => onOpenAgent(a.open.mid, a.open.sid)} style={{ paddingLeft: indentOf(depth) }}
+        className="flex size-full min-w-0 items-start gap-1.5 pt-px pr-2.5 text-left text-xs leading-4 transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset"
+        data-tree-row={a.key} data-tree-role={a.role} data-tree-depth={a.depth} data-ended={a.ended ? "" : undefined}>
+        <span className={cx("flex size-4 shrink-0 items-center justify-center rounded-chip bg-surface shadow-hairline", a.ended && "opacity-60")}>
+          {a.subagent || a.role === "subagent" ? <Icon name="cornerDownRight" size={10} className="text-ink-3" />
+            : <AgentMark {...(a.session ? sessionAgent(a.session) : { agent: a.agent })} size={10} decorative />}
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="flex h-4 min-w-0 items-center gap-1.5">
+            <span className={cx("min-w-0 flex-1 truncate", a.ended ? "text-ink-3" : "text-ink")}>{name}</span>
+            {a.ended ? <Icon name="check" size={11} className="shrink-0 text-ink-3" />
+              : a.state ? <span className="flex shrink-0 items-center"><StatusMark state={a.state} size="sm" label={false} /></span> : null}
+          </span>
+          <span className="h-4 truncate text-ink-3" data-tree-doing="">{[state, a.doing].filter(Boolean).join(" · ")}</span>
+        </span>
+      </button>
+    </li>
   );
 }
 
@@ -382,12 +534,12 @@ function NodeTip({ node, req, machines, now }: { node: GraphNode; req: GraphRequ
             {node.agents.map((a) => (
               <li key={a.key} className="flex items-start gap-1.5 text-xs">
                 <span className="mt-px flex size-4 shrink-0 items-center justify-center">
-                  {a.subagent ? <Icon name="cornerDownRight" size={11} /> : <AgentMark {...(a.session ? sessionAgent(a.session) : { agent: a.agent })} size={12} decorative className="text-tooltip-fg" />}
+                  {a.subagent || a.role === "subagent" ? <Icon name="cornerDownRight" size={11} /> : <AgentMark {...(a.session ? sessionAgent(a.session) : { agent: a.agent })} size={12} decorative className="text-tooltip-fg" />}
                 </span>
                 <span className="min-w-0">
                   <span className="block break-words">{(a.session && sessionTitle(a.session)) || a.title || t("request-graph.agent_untitled")}</span>
                   <span className="block break-words text-tooltip-muted">
-                    {[ROLE_KEY[a.role] ? t(ROLE_KEY[a.role]) : "", agentLine(a, machines, true)].filter(Boolean).join(" · ")}
+                    {[ROLE_KEY[a.role] ? t(ROLE_KEY[a.role]) : "", a.ended && a.role !== "before" ? t("request-graph.agent_ended") : "", agentLine(a, machines, true)].filter(Boolean).join(" · ")}
                   </span>
                 </span>
               </li>
@@ -397,7 +549,7 @@ function NodeTip({ node, req, machines, now }: { node: GraphNode; req: GraphRequ
           <p className="text-xs">{node.task ? taskLine(node, machines) || t("request-graph.no_agent") : t("request-graph.no_agent")}</p>
         )}
       </div>
-      <p className="text-xs break-words text-tooltip-muted">{t("request-graph.tip_request", { title: req.words })}</p>
+      <p className="text-xs break-words text-tooltip-muted">{t("request-graph.tip_request", { title: req.title })}</p>
       <p className="border-t border-tooltip-border pt-1 text-xs text-tooltip-muted">{node.todo ? t("request-graph.tip_open_todo") : t("request-graph.waits_start")}</p>
     </>
   );
@@ -408,9 +560,7 @@ function NodeTip({ node, req, machines, now }: { node: GraphNode; req: GraphRequ
 /** How many finished requests show at a time once the fold is open. */
 const DONE_PAGE = 30;
 
-function DoneFold({ done, machines, now, selectedId, tips, hot, onHot, onOpenTodo }: {
-  done: GraphRequest[]; machines: Machine[]; now: number; selectedId?: string; tips: TipApi; hot: Hot; onHot: (h: Hot) => void; onOpenTodo: (id: string) => void;
-}) {
+function DoneFold({ done, shared, hot, onHot }: { done: GraphRequest[]; shared: Shared; hot: Hot; onHot: (h: Hot) => void }) {
   const [open, setOpen] = useState(false);
   const [shown, setShown] = useState(DONE_PAGE);
   const [opened, setOpened] = useState<string | null>(null);
@@ -428,13 +578,13 @@ function DoneFold({ done, machines, now, selectedId, tips, hot, onHot, onOpenTod
               <button type="button" aria-expanded={opened === req.key} onClick={() => setOpened((v) => (v === req.key ? null : req.key))}
                 className="flex h-7 w-full min-w-0 items-center gap-2 rounded-control px-1.5 text-left text-xs transition-colors hover:bg-hover">
                 <Icon name="check" size={12} className="shrink-0 text-green" />
-                <span className="min-w-0 flex-1 truncate text-ink-2">{req.words}</span>
+                <span className="min-w-0 flex-1 truncate text-ink-2">{req.title}</span>
                 <span className="shrink-0 text-ink-3 tabular-nums">{t("request-graph.pieces", { count: req.nodes.length })}</span>
                 {req.finished > 0 && <span className="w-24 shrink-0 truncate text-right text-ink-3 tabular-nums">{clock(new Date(req.finished).toISOString())}</span>}
               </button>
               {opened === req.key && (
-                <RequestBlock req={req} machines={machines} now={now} selectedId={selectedId} hot={hot?.req === req.key ? hot.key : null} tips={tips} flat
-                  onHot={(key) => onHot(key ? { req: req.key, key } : null)} onOpenTodo={onOpenTodo} />
+                <RequestBlock req={req} shared={shared} hot={hot?.req === req.key ? hot.key : null} flat
+                  onHot={(key) => onHot(key ? { req: req.key, key } : null)} />
               )}
             </li>
           ))}

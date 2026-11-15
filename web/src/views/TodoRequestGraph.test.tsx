@@ -14,6 +14,7 @@ import type { TaskPlan } from "../lib/feed";
 import { caseKey, caseName, caseTodos, MERGE_CASES, type MergeCase } from "../lib/request-graph-merge-cases";
 import { makeSessionLookup, type Todo } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
+import { CARD_H } from "../lib/request-graph";
 import TodoRequestGraph from "./TodoRequestGraph";
 
 // the plans the feed knows: a test sets them and renders again
@@ -74,12 +75,20 @@ const leave = (el: Element) => act(() => { el.dispatchEvent(new PointerEvent("po
 
 describe("the requests graph", () => {
   it("draws each piece with its state and the Agent on it", () => {
-    expect(host.querySelector('[data-root="todo:req"]')!.textContent).toContain("ship the search page");
+    // the request to-do's title heads the root; the owner's words, which say something else, are quoted under it
+    const req = host.querySelector('[data-root="todo:req"]')!;
+    expect(req.querySelector("[data-root-words]")!.textContent).toBe("Search page");
+    expect(req.querySelector("[data-root-quote]")!.textContent).toBe("Your words: ship the search page");
+    expect(req.textContent).toContain("Request");
     expect(card("api").dataset.state).toBe("done");
     expect(card("back").dataset.state).toBe("working");
     expect(card("back").querySelector("[data-node-detail]")!.textContent).toMatch(/12/);
     expect(card("back").querySelector("[data-node-agent]")!.getAttribute("data-node-agent")).toBe("mac/b1");
-    expect(card("back").querySelector("[data-marks]")!.getAttribute("data-marks")).toBe("2");
+    // two Agents on it: each has its line in the tree under the card, the head keeps the first one's mark
+    expect(card("back").querySelector("[data-marks]")!.getAttribute("data-marks")).toBe("1");
+    expect([...host.querySelectorAll('[data-agent-tree="todo:back"] [data-tree-row]')].map((r) => r.getAttribute("data-tree-row"))).toEqual(["mac/b1", "mac/b2"]);
+    // one Agent: no tree
+    expect(host.querySelector('[data-agent-tree="todo:front"]')).toBeNull();
     expect(card("back").textContent).toContain("MacBook");
     expect(card("front").dataset.state).toBe("needs_you");
     expect(card("front").textContent).toContain("Empty state: show picks?");
@@ -151,20 +160,29 @@ describe("a request of one piece, and nothing queued", () => {
     <TodoRequestGraph todos={list} lookup={makeSessionLookup(lookupSessions)} machines={machines} onOpenTodo={() => {}} />,
   ));
 
-  it("draws one card with when it was said when the words are the piece's title, and both cards when they differ", () => {
+  it("draws one card when the request's heading is the piece's title, the owner's other words quoted on it", () => {
     render([
       todo("same", { title: "Rename the repo", agents: [link("s1")] }),
-      todo("other", { title: "Rename it", brief: { request: { text: "please rename the repo", at: at(3) } } as Todo["brief"] }),
+      todo("other", { title: "Rename it", brief: { request: { text: "Go ahead", at: at(3) } } as Todo["brief"] }),
+      todo("ship", { title: "Ship it", brief: { request: { text: "Go ahead and ship", at: at(3) } } as Todo["brief"] }),
+      todo("build", { title: "Build it", part_of: "ship" }),
     ], [session("s1")]);
     const same = host.querySelector('[data-request="todo:same"]')!;
     expect(same.querySelector("[data-root]")).toBeNull();
     expect(same.querySelectorAll("[data-edge]").length).toBe(0);
     expect(same.querySelector("[data-node-request]")!.textContent).toContain("Request");
+    expect(same.querySelector("[data-root-quote]")).toBeNull();
     expect(same.querySelector("[data-node]")!.textContent).toContain("Rename the repo");
+    // the owner answered "Go ahead": the task's title is what the card says, the words are a small quote on it
     const other = host.querySelector('[data-request="todo:other"]')!;
-    expect(other.querySelector("[data-root]")!.textContent).toContain("please rename the repo");
-    expect(other.querySelector("[data-node-request]")).toBeNull();
-    expect(other.querySelectorAll("[data-edge]").length).toBe(1);
+    expect(other.querySelector("[data-root]")).toBeNull();
+    expect(other.querySelector("[data-node-title]")!.textContent).toBe("Rename it");
+    expect(other.querySelector("[data-root-quote]")!.textContent).toBe("Your words: Go ahead");
+    // a request to-do with a piece of its own: both cards, the root headed by its title
+    const ship = host.querySelector('[data-request="todo:ship"]')!;
+    expect(ship.querySelector("[data-root-words]")!.textContent).toBe("Ship it");
+    expect(ship.querySelector("[data-root-quote]")!.textContent).toBe("Your words: Go ahead and ship");
+    expect(ship.querySelectorAll("[data-edge]").length).toBe(1);
   });
 
   it("keeps the root's card, to open the request's to-do, when its one piece of the same name is done and it is not", () => {
@@ -237,5 +255,74 @@ describe("a request of one piece, and nothing queued", () => {
   it("draws no queued strip when nothing is queued", () => {
     render([todo("w", { title: "Busy", agents: [link("s1")] })], [session("s1")]);
     expect(host.querySelector("[data-queued]")).toBeNull();
+  });
+});
+
+describe("a piece's Agent tree", () => {
+  const agentsOpened: string[] = [];
+  const lead = session("L", { title: "Lead the search work", activity: "Planning the split", subagents: [
+    { id: "e1", session_id: "L", description: "Find call sites", running: false, started_at: at(20), last_text: "Found 3" },
+    { id: "r1", session_id: "L", description: "Read the docs", running: true, started_at: at(10), last_tool: { name: "Read", summary: "docs/search.md" } },
+  ] });
+  const list = [
+    todo("lead", { title: "Search", agents: [link("L")] }),
+    todo("w1", { title: "Back end", origin: "mac/L", agents: [link("W1")] }),
+    todo("w2", { title: "Docs", origin: "mac/L", agents: [link("W2")], done_at: at(3) }),
+  ];
+  const rows = [lead, session("W1", { title: "Back end", state: "needs_you", status: "idle" }), session("W2", { title: "Docs", state: "idle", status: "idle", last_text: "Wrote the docs" })];
+  const draw = () => act(() => root.render(
+    <TodoRequestGraph todos={list} lookup={makeSessionLookup(rows)} machines={machines} onOpenTodo={(id) => opened.push(id)} onOpenAgent={(mid, sid) => agentsOpened.push(`${mid}/${sid}`)} />,
+  ));
+  const tree = () => host.querySelector<HTMLElement>('[data-agent-tree="todo:lead"]')!;
+  const line = (key: string) => tree().querySelector<HTMLButtonElement>(`[data-tree-row="${key}"]`)!;
+
+  beforeEach(() => { agentsOpened.length = 0; draw(); });
+
+  it("grows under the card: the leader, its workers, then its subagents, each a level in, an ended one grey with a check", () => {
+    expect([...tree().querySelectorAll("[data-tree-row]")].map((r) => [r.getAttribute("data-tree-row"), r.getAttribute("data-tree-role"), r.getAttribute("data-tree-depth")])).toEqual([
+      ["mac/L", "lead", "0"], ["mac/W1", "worker", "1"], ["mac/W2", "worker", "1"], ["sub:mac/L/e1", "subagent", "1"], ["sub:mac/L/r1", "subagent", "1"],
+    ]);
+    expect(tree().textContent).toContain("5 Agents");
+    expect(line("mac/L").textContent).toContain("Lead the search work");
+    expect(line("mac/L").querySelector("[data-tree-doing]")!.textContent).toBe("Working · Planning the split");
+    expect(line("mac/W1").querySelector("[data-tree-doing]")!.textContent).toBe("Needs you");
+    // ended ones stay while the piece goes on: grey, with a check, saying so
+    expect(line("mac/W2").hasAttribute("data-ended")).toBe(true);
+    expect(line("mac/W2").querySelector("[data-tree-doing]")!.textContent).toBe("Ended · Wrote the docs");
+    expect(line("sub:mac/L/e1").hasAttribute("data-ended")).toBe(true);
+    expect(line("sub:mac/L/r1").hasAttribute("data-ended")).toBe(false);
+    expect(line("sub:mac/L/r1").querySelector("[data-tree-doing]")!.textContent).toBe("Working · docs/search.md");
+    // a connector for every line that hangs under another
+    expect(tree().querySelectorAll("[data-tree-edges] path").length).toBe(4);
+    // the card is as tall as its head and its tree, and the request block makes room for it
+    const box = host.querySelector<HTMLElement>('[data-node-card="todo:lead"]')!;
+    expect(parseFloat(box.style.height)).toBeGreaterThan(CARD_H + 5 * 30);
+  });
+
+  it("opens a line's Agent (a subagent's launching session) and the head still opens the to-do", () => {
+    act(() => line("mac/W1").click());
+    act(() => line("sub:mac/L/r1").click());
+    expect(agentsOpened).toEqual(["mac/W1", "mac/L"]);
+    act(() => host.querySelector<HTMLButtonElement>('[data-node="todo:lead"]')!.click());
+    expect(opened).toEqual(["lead"]);
+  });
+
+  it("folds to its first line and opens again, the card shrinking with it", () => {
+    const box = () => host.querySelector<HTMLElement>('[data-node-card="todo:lead"]')!;
+    const tall = parseFloat(box().style.height);
+    const toggle = tree().querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    act(() => toggle.click());
+    expect(tree().querySelectorAll("[data-tree-row]").length).toBe(0);
+    expect(parseFloat(box().style.height)).toBeLessThan(tall);
+    act(() => tree().querySelector<HTMLButtonElement>("button[aria-expanded]")!.click());
+    expect(tree().querySelectorAll("[data-tree-row]").length).toBe(5);
+  });
+
+  it("lights the piece from anywhere on the card, the tree included", () => {
+    enter(line("mac/W1"));
+    expect(card("lead").hasAttribute("data-lit")).toBe(true);
+    leave(line("mac/W1"));
+    expect(card("lead").hasAttribute("data-lit")).toBe(false);
   });
 });

@@ -1,12 +1,14 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
-  buildGraph, CARD_H, CARD_W, layoutRequest, lineage, mergesWithRoot, pieceStep, queuedRows, requestWords, roundedPath, type GraphData, type GraphNode, type GraphRequest,
+  agentTree, buildGraph, CARD_H, CARD_W, ENDED_KEPT, layoutRequest, lineage, mergesWithRoot, notesWords, ownerWords, pieceStep, queuedRows, requestHeading, rootHeight,
+  roundedPath, TREE_HEAD_H, TREE_ROW_H, treeHeight, type GraphData, type GraphNode, type GraphRequest,
 } from "./request-graph";
 import { caseKey, caseName, caseTodos, MERGE_CASES, PIECES, ROOTS, type PieceKind, type RootKind } from "./request-graph-merge-cases";
 import type { PlanTask, TaskPlan } from "./feed";
 import { makeSessionLookup, todoStatus, type Todo } from "./todos";
-import type { Session } from "./types";
+import type { DirectionAgent, DirectionTree } from "./direction-tree";
+import type { Session, Subagent } from "./types";
 
 const at = (minutes: number) => new Date(Date.UTC(2026, 10, 14, 10, 0) + minutes * 60_000).toISOString();
 const todo = (id: string, patch: Partial<Todo> = {}): Todo => ({ id, title: id, created_at: at(0), updated_at: at(0), agents: [], ...patch });
@@ -31,7 +33,8 @@ describe("requests", () => {
     expect(done).toEqual([]);
     expect(active).toHaveLength(1);
     const r = active[0];
-    expect([r.kind, r.words, r.own, r.at]).toEqual(["parent", "please ship search", true, at(-5)]);
+    // the request to-do's title heads it; the owner's words, which say something else, are quoted under it
+    expect([r.kind, r.title, r.own, r.quote, r.at]).toEqual(["parent", "Ship the search page", false, "please ship search", at(-5)]);
     expect(r.nodes.map((n) => [n.key, n.layer])).toEqual([["todo:a", 1], ["todo:b", 2], ["todo:c", 2], ["todo:d", 3]]);
     expect([r.layers, r.rows]).toEqual([3, 2]);
     expect(r.edges.map((e) => `${e.from}>${e.to}`)).toEqual(["root>todo:a", "todo:a>todo:b", "todo:a>todo:c", "todo:b>todo:d", "todo:c>todo:d"]);
@@ -80,7 +83,8 @@ describe("requests", () => {
     ];
     const { active } = graph(todos, [session("s1", { state_since: at(1) })], { p1: p });
     const r = active.find((x) => x.kind === "plan")!;
-    expect([r.key, r.words, r.own, r.at]).toEqual(["plan:p1", "fix it and test it", true, at(-2)]);
+    // a plan of several tasks has no sentence of its own: the owner's words head it
+    expect([r.key, r.title, r.own, r.quote, r.at]).toEqual(["plan:p1", "fix it and test it", true, "", at(-2)]);
     // in the plan's order, whatever their creation
     expect(r.nodes.map((n) => [n.key, n.title, n.layer, n.state])).toEqual([["todo:f", "Fix", 1, "working"], ["todo:t", "Test", 2, "queued"]]);
     expect(node(r, "f").agents.map((a) => [a.key, a.role])).toEqual([["mac/s1", "lead"]]);
@@ -92,13 +96,13 @@ describe("requests", () => {
     const p = plan("p2", "open", [task("One", { brief: { request: { text: "do one and two", at: at(0) } } as PlanTask["brief"] }), task("Two")]);
     const r = graph([], [], { p2: p, gone: plan("gone", "dismissed", [task("x")]) }).active;
     expect(r).toHaveLength(1);
-    expect([r[0].words, r[0].nodes.map((n) => [n.title, n.state, n.waitsStart, n.layer])]).toEqual(["do one and two", [["One", "queued", true, 1], ["Two", "queued", true, 1]]]);
+    expect([r[0].title, r[0].nodes.map((n) => [n.title, n.state, n.waitsStart, n.layer])]).toEqual(["do one and two", [["One", "queued", true, 1], ["Two", "queued", true, 1]]]);
     expect(r[0].edges.every((e) => e.from === "root" && e.dashed)).toBe(true);
   });
 
   it("makes a lone to-do a request of one piece, under its own words", () => {
     const r = graph([todo("solo", { title: "Rename the repo", agents: [link("s1")] })], [session("s1", { state: "needs_you", status: "idle", asks: "Which name?" })]).active[0];
-    expect([r.kind, r.words, r.own]).toEqual(["single", "Rename the repo", false]);
+    expect([r.kind, r.title, r.own, r.quote]).toEqual(["single", "Rename the repo", false, ""]);
     expect([r.nodes[0].state, r.nodes[0].ask]).toEqual(["needs_you", "Which name?"]);
   });
 
@@ -116,7 +120,7 @@ describe("requests", () => {
     expect(active.find((r) => r.key === "todo:broke")!.nodes[0].state).toBe("failed");
   });
 
-  it("draws a leader's workers among its Agents, not as requests of their own, and lists earlier Agents last", () => {
+  it("draws a leader's workers among its Agents (a closed one ended), not as requests of their own, and lists earlier Agents last", () => {
     const todos = [
       todo("lead", { agents: [link("L"), link("old", { released_at: at(2) })] }),
       todo("w1", { origin: "mac/L", supervision: { supervisor: "mac/L" } as Todo["supervision"], agents: [link("W1")] }),
@@ -125,7 +129,9 @@ describe("requests", () => {
     const { active, done } = graph(todos, [session("L"), session("W1"), session("old", { state: "idle", status: "idle" })]);
     expect(done).toEqual([]);
     expect(active.map((r) => r.key)).toEqual(["todo:lead"]);
-    expect(active[0].nodes[0].agents.map((a) => [a.key, a.role])).toEqual([["mac/L", "lead"], ["mac/W1", "worker"], ["mac/old", "before"]]);
+    expect(active[0].nodes[0].agents.map((a) => [a.key, a.role, a.depth, a.parent, a.ended])).toEqual([
+      ["mac/L", "lead", 0, undefined, false], ["mac/W1", "worker", 1, "mac/L", false], ["mac/W2", "worker", 1, "mac/L", true], ["mac/old", "before", 0, undefined, true],
+    ]);
   });
 
   it("puts the most active request first: what needs the owner, then work going on, then what waits", () => {
@@ -140,22 +146,32 @@ describe("requests", () => {
 });
 
 describe("a request of one piece that says the same", () => {
-  it("is drawn as the piece's card alone when its words are the piece's title, spaces aside", () => {
+  it("is drawn as the piece's card alone when its heading is the piece's title, spaces aside, the owner's other words quoted on it", () => {
     const g = graph([
       todo("same", { title: "Rename  the repo " , brief: { request: { text: " Rename the\nrepo", at: at(0) } } as Todo["brief"] }),
-      todo("other", { title: "Rename the repo", brief: { request: { text: "please rename it", at: at(0) } } as Todo["brief"] }),
+      // the owner said "Go ahead" to the assistant: the task's title is the heading, the words are quoted
+      todo("goahead", { title: "Rename the repo", brief: { request: { text: "Go ahead", at: at(0) } } as Todo["brief"] }),
       todo("req", { title: "Search" }),
       todo("one", { title: "Search", part_of: "req" }),
+      todo("ship", { title: "Ship it" }),
+      todo("build", { title: "Build it", part_of: "ship" }),
     ]);
     const by = (k: string) => g.active.find((r) => r.key === k)!;
-    expect([by("todo:same").merged, by("todo:same").edges]).toEqual([true, []]);
-    expect(by("todo:other").merged).toBe(false);
-    expect(by("todo:other").edges.map((e) => e.from)).toEqual(["root"]);
+    expect([by("todo:same").merged, by("todo:same").edges, by("todo:same").quote]).toEqual([true, [], ""]);
+    expect([by("todo:goahead").merged, by("todo:goahead").title, by("todo:goahead").quote]).toEqual([true, "Rename the repo", "Go ahead"]);
+    expect(by("todo:ship").merged).toBe(false);
+    expect(by("todo:ship").edges.map((e) => e.from)).toEqual(["root"]);
     // a parent with one piece of the same name merges too
     expect(by("todo:req").merged).toBe(true);
     const lay = layoutRequest(by("todo:same"));
     expect([lay.edges, lay.nodes.get("todo:same")!.x, lay.width]).toEqual([[], lay.root.x, lay.root.x * 2 + CARD_W]);
-    expect(layoutRequest(by("todo:other")).nodes.get("todo:other")!.x).toBeGreaterThan(CARD_W);
+    expect(layoutRequest(by("todo:ship")).nodes.get("todo:build")!.x).toBeGreaterThan(CARD_W);
+  });
+
+  it("heads a one-task plan with its task's title, the owner's words quoted", () => {
+    const p = plan("p", "started", [task("Tidy the By request headings", { todo_id: "x", brief: { request: { text: "Go ahead", at: at(0) } } as PlanTask["brief"] })]);
+    const r = graph([todo("x", { plan_id: "p", title: "Tidy the By request headings" })], [], { p }).active[0];
+    expect([r.kind, r.title, r.own, r.quote, r.merged]).toEqual(["plan", "Tidy the By request headings", false, "Go ahead", true]);
   });
 
   it("keeps the root's card when the root and its piece disagree on done", () => {
@@ -232,7 +248,7 @@ describe("root × piece: when one card stands for both", () => {
   });
 
   it("answers mergesWithRoot from the stored state, and the drawn one only for a plan's task with no to-do", () => {
-    const n = (patch: Partial<GraphNode>): GraphNode => ({ key: "k", title: "t", layer: 1, row: 0, after: [], waitsFor: [], waitsStart: false, state: "ready", agents: [], ask: "", ...patch });
+    const n = (patch: Partial<GraphNode>): GraphNode => ({ key: "k", title: "t", layer: 1, row: 0, after: [], waitsFor: [], waitsStart: false, state: "ready", agents: [], tree: [], ask: "", ...patch });
     // a task with no to-do: its drawn state is all there is
     expect([mergesWithRoot(todo("r"), n({ state: "queued" })), mergesWithRoot(todo("r", { done_at: at(1) }), n({ state: "done" }))]).toEqual([true, true]);
     expect(mergesWithRoot(todo("r"), n({ state: "done" }))).toBe(false);
@@ -311,9 +327,96 @@ describe("where a to-do stands", () => {
     expect(step(todo("f", { agents: [agentOn("s")], supervision: { supervisor: "conv", state: "accepted", reviews: [{ at: at(2), verdict: "accepted" }] } }), [idle("s")])).toBe("accepted");
   });
 
-  it("quotes the user's own words when the brief keeps them, else the title", () => {
-    expect(requestWords(todo("t", { title: "Fix it", brief: { id: "b", created_at: at(0), started_by: "owner", goal: "g", request: { text: " It crashes, fix it ", at: at(0) } } }))).toEqual({ text: "It crashes, fix it", own: true });
-    expect(requestWords(todo("t", { title: "Fix it" }))).toEqual({ text: "Fix it", own: false });
+  it("takes the owner's words from the brief, else from a request to-do's notes", () => {
+    const brief = { id: "b", created_at: at(0), started_by: "owner", goal: "g", request: { text: " It crashes, fix it ", at: at(0) } } as Todo["brief"];
+    expect(ownerWords(todo("t", { title: "Fix it", brief, notes: "原话：别的" }))).toBe("It crashes, fix it");
+    expect(ownerWords(todo("t", { title: "Fix it" }))).toBe("");
+    // the main assistant's lines: the first is the request as first said
+    const notes = "用户原话（2026-11-15 14:23）：我今天固态硬盘到了，指导我操作\n用户原话（2026-11-15 14:43）：还有什么都能放过去\n\n硬盘：1TB";
+    expect(ownerWords(todo("t", { notes }))).toBe("我今天固态硬盘到了，指导我操作");
+    expect(notesWords("parent: x\n原话：「把旧盘清掉」")).toBe("把旧盘清掉");
+    expect(notesWords("Your words:\n\n\"Clean up the old disk\"\nmore")).toBe("Clean up the old disk");
+    expect(notesWords("Owner's words (Nov 15): ship it")).toBe("ship it");
+    expect(notesWords("ユーザーの言葉：進めて")).toBe("進めて");
+    // not at a line's start, or another label: no words
+    expect(notesWords("see 原话：x\nKeywords: y\nnotes")).toBe("");
+  });
+
+  it("heads a request with the sentence it was filed under, the owner's words quoted only when they differ", () => {
+    expect(requestHeading("Fix the login", "Go ahead")).toEqual({ title: "Fix the login", own: false, quote: "Go ahead" });
+    expect(requestHeading("Fix the login", " Fix  the login")).toEqual({ title: "Fix the login", own: false, quote: "" });
+    expect(requestHeading("Fix the login", "")).toEqual({ title: "Fix the login", own: false, quote: "" });
+    expect(requestHeading("  ", "Go ahead")).toEqual({ title: "Go ahead", own: true, quote: "" });
+  });
+});
+
+describe("a piece's Agent tree", () => {
+  const dir = (todoId: string, agents: DirectionAgent[]): DirectionTree =>
+    ({ directions: [{ id: "main", name: "", tasks: [{ id: todoId, title: todoId, state: "working", agents }] }] }) as unknown as DirectionTree;
+  const sub = (id: string, patch: Partial<Subagent> = {}): Subagent => ({ id, session_id: "L", description: `sub ${id}`, ...patch });
+
+  it("reads the leader, then its workers (open and closed), what it spawned and its subagents, each under what it hangs from", () => {
+    const todos = [
+      todo("lead", { agents: [link("L")] }),
+      todo("w1", { title: "Worker one", origin: "mac/L", agents: [link("W1")] }),
+      todo("w2", { title: "Worker two", supervision: { supervisor: "mac/L" } as Todo["supervision"], agents: [link("W2", { released_at: at(8) })], done_at: at(9) }),
+    ];
+    const tree = dir("lead", [{ machine_id: "mac", session_id: "L", title: "lead", state: "working", children: [
+      { machine_id: "mac", session_id: "S", title: "spawned", state: "working" },
+      { machine_id: "mac", session_id: "W1", title: "Worker one", state: "working" },
+      { machine_id: "mac", session_id: "L@r1", title: "sub r1", state: "working", children: [{ machine_id: "mac", session_id: "L@fresh", title: "just launched", state: "working" }] },
+    ] }]);
+    // the list's summary row has no subagents; the complete row has them, the ended one too
+    const summary = [session("L"), session("W1", { activity: "Reading the index" }), session("W2", { state: "idle", status: "idle", last_text: "Done: wrote the API\nmore" }), session("S")];
+    const full = [session("L", { subagents: [
+      sub("e1", { running: false, started_at: at(1), last_text: "Found 3 call sites" }),
+      sub("r1", { running: true, started_at: at(2), last_tool: { name: "Grep", summary: "grep foo" } }),
+      sub("n1", { running: true, started_at: at(3), parent_id: "r1" }),
+    ] })];
+    const d: GraphData = { todos, tree, lookup: makeSessionLookup(summary), complete: makeSessionLookup(full) };
+    const agents = buildGraph({ todos, plans: {}, data: d }).active[0].nodes[0].agents;
+    expect(agents.map((a) => [a.key, a.role, a.depth, a.parent ?? "", a.ended])).toEqual([
+      ["mac/L", "lead", 0, "", false],
+      ["mac/W1", "worker", 1, "mac/L", false],
+      ["mac/W2", "worker", 1, "mac/L", true],
+      ["mac/S", "spawned", 1, "mac/L", false],
+      ["sub:mac/L/e1", "subagent", 1, "mac/L", true],
+      ["sub:mac/L/r1", "subagent", 1, "mac/L", false],
+      ["sub:mac/L/n1", "subagent", 2, "sub:mac/L/r1", false],
+      // the direction tree's running one the complete row does not have yet
+      ["sub:mac/L/fresh", "subagent", 2, "sub:mac/L/r1", false],
+    ]);
+    const by = (k: string) => agents.find((a) => a.key === k)!;
+    expect([by("mac/W1").doing, by("mac/W2").doing, by("sub:mac/L/e1").doing, by("sub:mac/L/r1").doing]).toEqual(["Reading the index", "Done: wrote the API", "Found 3 call sites", "grep foo"]);
+    // a subagent opens the session that launched it
+    expect([by("sub:mac/L/n1").open, by("mac/W2").open]).toEqual([{ mid: "mac", sid: "L" }, { mid: "mac", sid: "W2" }]);
+    expect([by("sub:mac/L/e1").state, by("sub:mac/L/r1").state]).toEqual(["", "working"]);
+  });
+
+  it("keeps a summary row's running subagents from the direction tree when no complete row is there", () => {
+    const todos = [todo("lead", { agents: [link("L")] })];
+    const tree = dir("lead", [{ machine_id: "mac", session_id: "L", title: "lead", state: "working", children: [{ machine_id: "mac", session_id: "L@a", title: "Explore the API", state: "working" }] }]);
+    const agents = buildGraph({ todos, plans: {}, data: { todos, tree, lookup: makeSessionLookup([session("L")]) } }).active[0].nodes[0].agents;
+    expect(agents.map((a) => [a.key, a.role, a.title, a.ended])).toEqual([["mac/L", "lead", "agent L", false], ["sub:mac/L/a", "subagent", "Explore the API", false]]);
+  });
+
+  it("is drawn only when more than one Agent is on the piece, the earlier ones aside", () => {
+    const one = graph([todo("t", { agents: [link("A"), link("old", { released_at: at(1) })] })], [session("A")]).active[0].nodes[0];
+    expect([one.agents.length, one.tree]).toEqual([2, []]);
+    const two = graph([todo("t", { agents: [link("A"), link("B")] })], [session("A"), session("B")]).active[0].nodes[0];
+    expect(two.tree.map((r) => [r.kind, r.key, r.depth])).toEqual([["agent", "mac/A", 0], ["agent", "mac/B", 0]]);
+  });
+
+  it("folds the earlier ended subagents of one parent into one line, never a running one", () => {
+    const ended = Array.from({ length: ENDED_KEPT + 2 }, (_, i) => sub(`e${i}`, { running: false, started_at: at(i) }));
+    const todos = [todo("lead", { agents: [link("L")] })];
+    const full = [session("L", { subagents: [...ended, sub("run", { running: true, started_at: at(0.5) })] })];
+    const n = buildGraph({ todos, plans: {}, data: { todos, tree: null, lookup: makeSessionLookup(full) } }).active[0].nodes[0];
+    expect(n.agents).toHaveLength(ENDED_KEPT + 4);
+    expect(n.tree.map((r) => (r.kind === "more" ? `more ${r.count}` : r.key))).toEqual([
+      "mac/L", "more 2", "sub:mac/L/run", ...ended.slice(2).map((e) => `sub:mac/L/${e.id}`),
+    ]);
+    expect(agentTree(n.agents.slice(0, 1))).toEqual([]);
   });
 });
 
@@ -341,5 +444,43 @@ describe("geometry", () => {
   it("rounds the corners of a path, never by more than half a leg", () => {
     expect(roundedPath([[0, 0], [10, 0], [10, 4], [20, 4]])).toBe("M0 0 L8 0 Q10 0 10 2 L10 2 Q10 4 12 4 L20 4");
     expect(roundedPath([[0, 0], [0, 0]])).toBe("");
+  });
+});
+
+describe("geometry with Agent trees and quotes", () => {
+  it("makes a row as tall as its tallest card, the tree under it, and keeps every connector on the cards' heads", () => {
+    const todos = [
+      todo("req", { title: "Ship", brief: { request: { text: "go", at: at(0) } } as Todo["brief"] }),
+      todo("a", { part_of: "req", agents: [link("A1"), link("A2")] }),
+      todo("b", { part_of: "req" }),
+      todo("c", { part_of: "req", after: ["a"] }),
+      todo("d", { part_of: "req", after: ["req"] }),
+    ];
+    const r = graph(todos, [session("A1"), session("A2")]).active[0];
+    const a = r.nodes.find((n) => n.key === "todo:a")!;
+    expect(a.tree).toHaveLength(2);
+    const h = treeHeight(a.tree, true);
+    expect(h).toBe(TREE_HEAD_H + 2 * TREE_ROW_H + 6);
+    expect(treeHeight(a.tree, false)).toBe(TREE_HEAD_H);
+    expect(treeHeight([], true)).toBe(0);
+    const lay = layoutRequest(r, (n) => treeHeight(n.tree, true));
+    const pa = lay.nodes.get("todo:a")!, pb = lay.nodes.get(r.nodes.find((n) => n.row === 1 && n.layer === 1)!.key)!;
+    expect(pa.h).toBe(CARD_H + h);
+    // the root quotes the owner: a line taller
+    expect(lay.root.h).toBe(rootHeight(r));
+    expect(rootHeight(r)).toBeGreaterThan(CARD_H);
+    // the row under a's starts below a's tree
+    expect(pb.y).toBeGreaterThanOrEqual(pa.y + pa.h);
+    for (const e of lay.edges) {
+      const s = e.from === "root" ? lay.root : lay.nodes.get(e.from)!;
+      expect(e.dot).toEqual([s.x + CARD_W, s.y + CARD_H / 2]);
+    }
+    // nothing overlaps, trees included
+    const boxes = [lay.root, ...lay.nodes.values()];
+    for (const p of boxes) for (const q of boxes) {
+      if (p === q) continue;
+      expect(p.x + CARD_W <= q.x || q.x + CARD_W <= p.x || p.y + p.h <= q.y || q.y + q.h <= p.y, `${p.key} / ${q.key}`).toBe(true);
+    }
+    expect(lay.height).toBeGreaterThanOrEqual(Math.max(...boxes.map((b) => b.y + b.h)));
   });
 });

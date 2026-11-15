@@ -8997,7 +8997,9 @@ def retry_task(h, tid):
 # The search page is a request of six pieces in a diamond: the API fields done, the back end working on Codex (with a
 # helper Agent beside it), the front end asking a decision, the end-to-end tests waiting for both, the docs waiting for
 # the tests, and the tracking that could start but nobody took. A plan nobody started yet (push on iOS and Android, three
-# tasks) and a finished request (the login crash, two pieces) come with it. Off by default.
+# tasks) and a finished request (the login crash, two pieces) come with it. The back end grows an Agent tree: its Codex
+# leader handed out two workers (one done), and the helper beside it runs subagents (one ended, one nested in another).
+# A request of one piece the owner only answered "提吧" to is headed by its task's title, the words quoted. Off by default.
 if MOCK_TASKS and os.environ.get("MOCK_REQUEST_GRAPH") == "1":
     _g_sid = lambda k: "9a7bc0de-0000-4000-8000-%012d" % k
     _g_cwd = "/Users/me/code/shop"
@@ -9027,7 +9029,23 @@ if MOCK_TASKS and os.environ.get("MOCK_REQUEST_GRAPH") == "1":
                 agents=[dict(_g_agent(1, "定搜索接口的字段", "idle", "字段定好了，写在 docs/search-api.md。", minutes=62), released_at=ago(minutes=60))]),
         _g_todo("todo_graph_backend", "后端：实现 /search 接口和分页", "todo_graph_search", after=("todo_graph_fields",), minutes=60,
                 agents=[_g_agent(2, "后端：实现 /search 接口", "working", "在写分页游标。", kind="codex", state_since=ago(minutes=23), effort="high"),
-                        _g_agent(3, "查现有的索引", "working", "在看 orders 表上的索引。", state_since=ago(minutes=6))]),
+                        _g_agent(3, "查现有的索引", "working", "在看 orders 表上的索引。", state_since=ago(minutes=6), subagents=[
+                            {"id": "ga1", "session_id": _g_sid(3), "type": "Explore", "description": "列出 orders 表现有的索引", "running": False,
+                             "started_at": ago(minutes=6), "last_text": "共 4 个索引，没有覆盖 name 字段。"},
+                            {"id": "ga2", "session_id": _g_sid(3), "type": "Explore", "description": "找搜索会用到的慢查询", "running": True,
+                             "started_at": ago(minutes=4), "last_tool": {"name": "Grep", "summary": "grep -rn \"LIKE '%\" server/"}},
+                            {"id": "ga3", "session_id": _g_sid(3), "type": "general-purpose", "description": "对比两种分页方案", "running": True,
+                             "started_at": ago(minutes=2), "parent_id": "ga2", "last_tool": {"name": "Read", "summary": "docs/pagination.md"}}])]),
+        # the back end's workers: its Codex leader handed them out (origin), one still going, one done
+        _g_todo("todo_graph_backend_test", "后端：游标分页的单元测试", "", minutes=20, origin="macbook/" + _g_sid(2),
+                agents=[_g_agent(5, "后端：游标分页的单元测试", "working", "在补翻到最后一页的用例。", state_since=ago(minutes=12))]),
+        _g_todo("todo_graph_backend_index", "后端：给 orders 表加搜索索引", "", minutes=40, origin="macbook/" + _g_sid(2), done_at=ago(minutes=15),
+                agents=[dict(_g_agent(6, "后端：给 orders 表加搜索索引", "idle", "索引加好了，迁移在 0042。", minutes=15), released_at=ago(minutes=15))]),
+        # the owner only answered "提吧": the task's title heads it, the words are quoted on the card
+        _g_todo("todo_graph_tiba", "按要求视图：根卡片改用任务标题，原话放在下面", "", minutes=8,
+                brief={"id": "brief_graph_tiba", "created_at": ago(minutes=8), "started_by": "owner", "goal": "根卡片用任务标题",
+                       "done_when": [], "request": {"text": "提吧", "at": ago(minutes=8), "conversation": ASK1}},
+                agents=[_g_agent(7, "按要求视图：根卡片改用任务标题", "working", "在改 request-graph.ts。", state_since=ago(minutes=5))]),
         _g_todo("todo_graph_frontend", "前端：搜索结果页和空状态", "todo_graph_search", after=("todo_graph_fields",), minutes=60,
                 agents=[_g_agent(4, "前端：搜索结果页", "needs_you", "结果为空时显示推荐商品还是只显示空白？",
                                  asks="结果为空时显示推荐商品还是只显示空白？", state_since=ago(minutes=9))]),

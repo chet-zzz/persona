@@ -11,11 +11,15 @@
 // the plan's words; an open plan not started yet shows its tasks as pieces waiting for Start; (3) a to-do with neither,
 // a request of one piece. A to-do belongs to exactly one request: `part_of` wins over its plan. A worker a
 // leader's Agent handed out is drawn on the leader's piece, among its Agents, not as a request of its own.
+//
+// A request's heading is the sentence its work was filed under (the request to-do's title, the one task's title), with
+// the owner's own words quoted under it when they say something else ("Go ahead" is the owner's words, not a heading):
+// the brief keeps them, else a request to-do's notes do, on a line like `用户原话（…）：…` / `Your words: …`.
 import { foldedState } from "./child-sessions";
 import type { DirectionAgent, DirectionTask, DirectionTree } from "./direction-tree";
 import type { PlanTask, TaskPlan } from "./feed";
 import { reviewState } from "./supervision";
-import { acceptedAtRest, interruption, isAutoDone, openAsk, todoStatus, type SessionLookup, type Todo, type TodoStatus } from "./todos";
+import { acceptedAtRest, interruption, isAutoDone, openAsk, taskNow, todoStatus, type SessionLookup, type Todo, type TodoStatus } from "./todos";
 import type { AgentState, Session, Subagent } from "./types";
 
 // ── what a piece is and where it stands ─────────────────────
@@ -47,7 +51,23 @@ export interface NodeAgent {
   title: string;
   state: AgentState | "";
   role: AgentRole;
+  /** How far down the piece's Agent tree: 0 for the piece's own Agents (and the earlier ones), 1 for what they handed
+   *  out, spawned or launched, and so on. */
+  depth: number;
+  /** The row it hangs under (a key of this list); none at depth 0. */
+  parent?: string;
+  /** It finished while the piece goes on: a worker whose to-do closed, a subagent that returned, an earlier Agent. */
+  ended: boolean;
+  /** What it does now, or the last it said (one line, "" when nothing is known). */
+  doing: string;
+  /** The session that opens for it: its own, a subagent's launching session. */
+  open: { mid: string; sid: string };
 }
+
+/** A line of a piece's Agent tree: an Agent, or the ended subagents folded under one parent ("3 more ended"). */
+export type TreeRow =
+  | { kind: "agent"; key: string; depth: number; agent: NodeAgent }
+  | { kind: "more"; key: string; depth: number; count: number; parent?: string };
 
 export interface GraphNode {
   key: string;
@@ -68,6 +88,9 @@ export interface GraphNode {
   state: NodeState;
   status?: TodoStatus;
   agents: NodeAgent[];
+  /** Its Agents as a tree under the card, when more than one is on it (the earlier ones aside); [] keeps the card as it
+   *  was, its one Agent on its bottom line. */
+  tree: TreeRow[];
   /** What it asks the owner (needs_you), or why it did not start (failed). */
   ask: string;
   /** Since when it is in its state (ms), when known. */
@@ -87,9 +110,11 @@ export interface GraphEdge {
 export interface GraphRequest {
   key: string;
   kind: RequestKind;
-  /** The owner's words, else the title they were filed under (`own` false). */
-  words: string;
+  /** Its heading: the sentence the work was filed under; the owner's words (`own`) only when nothing else names it. */
+  title: string;
   own: boolean;
+  /** The owner's own words when they say something else than the heading, quoted under it; "" when not. */
+  quote: string;
   /** When it was said (ISO), when known. */
   at?: string;
   /** The parent to-do (kind parent), the plan (kind plan). */
@@ -104,7 +129,7 @@ export interface GraphRequest {
   touched: number;
   /** When its last piece closed (ms), for a done request. */
   finished: number;
-  /** One piece whose title is the request's words, closed exactly when the request's own to-do is (mergesWithRoot):
+  /** One piece whose title is the request's heading, closed exactly when the request's own to-do is (mergesWithRoot):
    * drawn as that piece's card alone (with when it was said). */
   merged: boolean;
 }
@@ -128,6 +153,9 @@ export interface GraphData {
   tree: DirectionTree | null | undefined;
   todos: readonly Todo[];
   lookup: SessionLookup;
+  /** Complete session rows, when the view has them: a list's summary row leaves out a session's subagents (running and
+   *  ended), so they are read from here. */
+  complete?: SessionLookup;
 }
 
 const ms = (iso: string | null | undefined) => {
@@ -151,47 +179,149 @@ function directionTask(tree: DirectionTree | null | undefined, todoId: string): 
   return undefined;
 }
 
-/** The open to-dos a leader's Agent handed out (its workers): their ledger names it as supervisor, or their origin is it. */
+/** The to-dos a leader's Agent handed out (its workers), open and closed: their ledger names it as supervisor, or their
+ *  origin is it. A closed one stays on the leader's piece, ended, while the piece goes on. */
 function workersOf(todos: readonly Todo[], mid: string, sid: string): Todo[] {
   const r = ref(mid, sid);
-  return todos.filter((td) => !td.done_at && (td.supervision?.supervisor === r || td.origin === r));
+  return todos.filter((td) => td.supervision?.supervisor === r || td.origin === r);
 }
 
 type AgentLink = { machine_id: string; session_id: string; title?: string; agent?: string; state?: string; children?: DirectionAgent[] };
 
-/** Every Agent on a to-do: its own (the direction tree's, with what each spawned, else the to-do's own links), the
- *  workers a leader handed out and their Agents, running subagents, then the ones it had before. */
+/** The first line of what was said, trimmed. */
+const firstLine = (s: string | undefined | null) => (s ?? "").trim().split(/\r?\n/, 1)[0].trim();
+
+/** The subagent id in a direction tree child's session id ("<session>@<agent id>", the hub's sessionKids), when it is
+ *  one of session `sid`'s in-session subagents. */
+const subagentId = (childSid: string, sid: string) => (childSid.startsWith(`${sid}@`) ? childSid.slice(sid.length + 1) : undefined);
+
+/** Which to-do had each Agent (refs "machine/session"), per to-do list: a direction tree child that is another to-do's
+ *  Agent is a worker. */
+const ownersCache = new WeakMap<readonly Todo[], Map<string, Todo>>();
+function ownerOfAgent(todos: readonly Todo[], key: string): Todo | undefined {
+  let owners = ownersCache.get(todos);
+  if (!owners) {
+    owners = new Map();
+    for (const t of todos) for (const a of t.agents ?? []) if (!owners.has(ref(a.machine_id, a.session_id))) owners.set(ref(a.machine_id, a.session_id), t);
+    ownersCache.set(todos, owners);
+  }
+  return owners.get(key);
+}
+
+/**
+ * Every Agent on a to-do, as a tree in reading order (each row before what hangs under it): its own (the direction tree's,
+ * else the to-do's own links), and under each, first the workers it handed out (open and closed) with their own trees,
+ * then the Agents it spawned, then its in-session subagents (running and ended, nested by the subagent that launched
+ * each, the earliest first); the ones it had before come last. A summary row has no subagents, so they are read from the
+ * complete row when there is one, and the direction tree's running ones fill in what a stale row does not have yet.
+ */
 export function nodeAgents(todo: Todo, data: GraphData): NodeAgent[] {
   const out: NodeAgent[] = [];
   const seen = new Set<string>();
-  const visit = (a: AgentLink, role: AgentRole, depth: number) => {
+  const subagents = (a: AgentLink, s: Session | undefined, depth: number, parent: string) => {
+    const mid = a.machine_id, sid = a.session_id;
+    const list = data.complete?.(mid, sid)?.subagents ?? s?.subagents ?? [];
+    type Sub = { id: string; parent?: string; title: string; running: boolean; at?: number; doing: string; sub?: Subagent; i: number };
+    const subs: Sub[] = list.map((x, i) => ({
+      id: x.id, parent: x.parent_id, title: x.description?.trim() || x.type || "", running: Boolean(x.running), at: ms(x.started_at),
+      doing: firstLine(x.running ? x.last_tool?.summary || x.last_text : x.last_text), sub: x, i,
+    }));
+    const fromTree = (kids: DirectionAgent[] | undefined, under?: string) => {
+      for (const c of kids ?? []) {
+        const id = subagentId(c.session_id, sid);
+        if (id === undefined) continue;
+        if (!subs.some((x) => x.id === id)) subs.push({ id, parent: under, title: c.title, running: true, doing: "", i: subs.length });
+        fromTree(c.children, id);
+      }
+    };
+    fromTree(a.children);
+    if (!subs.length) return;
+    const ids = new Set(subs.map((x) => x.id));
+    const order = (x: Sub, y: Sub) => (x.at ?? Infinity) - (y.at ?? Infinity) || x.i - y.i;
+    const placed = new Set<string>();
+    const emit = (x: Sub, d: number, under: string) => {
+      placed.add(x.id);
+      const key = `sub:${mid}/${sid}/${x.id}`;
+      out.push({
+        key, mid, agent: s?.agent || a.agent, subagent: x.sub, title: x.title, state: x.running ? "working" : "", role: "subagent",
+        depth: d, parent: under, ended: !x.running, doing: x.doing, open: { mid, sid },
+      });
+      for (const y of subs.filter((y) => y.parent === x.id && y.id !== x.id && !placed.has(y.id)).sort(order)) emit(y, d + 1, key);
+    };
+    const top = subs.filter((x) => !x.parent || x.parent === x.id || !ids.has(x.parent)).sort(order);
+    for (const x of top) if (!placed.has(x.id)) emit(x, depth, parent);
+    // launched by one another in a loop: at the top, so none is lost
+    for (const x of [...subs].sort(order)) if (!placed.has(x.id)) emit(x, depth, parent);
+  };
+  const visit = (a: AgentLink, role: AgentRole, depth: number, parent: string | undefined, ended: boolean) => {
     const s = data.lookup(a.machine_id, a.session_id);
     const key = ref(a.machine_id, a.session_id);
     seen.add(key);
-    out.push({ key, mid: a.machine_id, agent: s?.agent || a.agent, session: s, title: s?.title || a.title || "", state: (s ? foldedState(s) : (a.state as AgentState | undefined)) || "", role });
-    for (const c of a.children ?? []) if (!seen.has(ref(c.machine_id, c.session_id))) visit(c, "spawned", depth + 1);
-    if (depth < MAX_DEPTH) for (const w of workersOf(data.todos, a.machine_id, a.session_id)) on(w, "worker", depth + 1);
-    for (const sub of s?.subagents ?? []) {
-      if (!sub.running) continue;
-      const k = `sub:${a.machine_id}/${s!.session_id}/${sub.id}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push({ key: k, mid: a.machine_id, subagent: sub, title: sub.description?.trim() || sub.type || "", state: "working", role: "subagent" });
+    const state = (s ? foldedState(s) : (a.state as AgentState | undefined)) || "";
+    out.push({
+      key, mid: a.machine_id, agent: s?.agent || a.agent, session: s, title: s?.title || a.title || "", state, role, depth, parent, ended,
+      doing: firstLine(taskNow(s, !ended && state === "working")?.text), open: { mid: a.machine_id, sid: a.session_id },
+    });
+    const kids = (a.children ?? []).filter((c) => subagentId(c.session_id, a.session_id) === undefined);
+    // the workers it handed out: those the direction tree hangs under it, then those the to-dos name it for
+    if (depth < MAX_DEPTH) {
+      const workers: Todo[] = [];
+      for (const c of kids) {
+        const owner = ownerOfAgent(data.todos, ref(c.machine_id, c.session_id));
+        if (owner && owner.id !== todo.id && !workers.includes(owner)) workers.push(owner);
+      }
+      for (const w of workersOf(data.todos, a.machine_id, a.session_id)) if (w.id !== todo.id && !workers.includes(w)) workers.push(w);
+      for (const w of workers) on(w, "worker", depth + 1, key, Boolean(w.done_at));
     }
+    for (const c of kids) if (!seen.has(ref(c.machine_id, c.session_id))) visit(c, "spawned", depth + 1, key, false);
+    subagents(a, s, depth + 1, key);
   };
-  const on = (td: Todo, role: AgentRole, depth: number) => {
+  const on = (td: Todo, role: AgentRole, depth: number, parent: string | undefined, ended: boolean) => {
     const tree = directionTask(data.tree, td.id)?.agents;
-    const list: AgentLink[] = tree?.length ? tree : (td.agents ?? []).filter((a) => !a.released_at);
-    for (const a of list) if (!seen.has(ref(a.machine_id, a.session_id))) visit(a, role, depth);
+    let list: AgentLink[] = tree?.length ? tree : (td.agents ?? []).filter((a) => !a.released_at);
+    // a closed worker's Agents may all be released: the one it had last stands for it
+    if (!list.length && ended && td.agents?.length) list = [td.agents[td.agents.length - 1]];
+    for (const a of list) if (!seen.has(ref(a.machine_id, a.session_id))) visit(a, role, depth, parent, ended);
   };
-  on(todo, "lead", 0);
+  on(todo, "lead", 0, undefined, false);
   for (const a of todo.agents ?? []) {
     if (!a.released_at || seen.has(ref(a.machine_id, a.session_id))) continue;
     const s = data.lookup(a.machine_id, a.session_id);
     seen.add(ref(a.machine_id, a.session_id));
-    out.push({ key: ref(a.machine_id, a.session_id), mid: a.machine_id, agent: s?.agent || a.agent, session: s, title: s?.title || a.title || "", state: s ? foldedState(s) : "", role: "before" });
+    out.push({
+      key: ref(a.machine_id, a.session_id), mid: a.machine_id, agent: s?.agent || a.agent, session: s, title: s?.title || a.title || "",
+      state: s ? foldedState(s) : "", role: "before", depth: 0, ended: true, doing: firstLine(s?.last_text), open: { mid: a.machine_id, sid: a.session_id },
+    });
   }
   return out;
+}
+
+/** How many ended subagents of one parent stay on their own line; the earlier ones fold into one "more ended" line. */
+export const ENDED_KEPT = 3;
+
+/**
+ * A piece's Agent tree under its card: every Agent in `agents` (nodeAgents' order), when more than one is on it, the
+ * earlier ones aside ([] otherwise: the card keeps its one Agent on its bottom line). Under one parent, ended subagents
+ * that launched nothing beyond the latest ENDED_KEPT fold into one line, where the first of them was.
+ */
+export function agentTree(agents: readonly NodeAgent[]): TreeRow[] {
+  if (agents.filter((a) => a.role !== "before").length <= 1) return [];
+  const parents = new Set(agents.map((a) => a.parent).filter(Boolean));
+  const leaf = (a: NodeAgent) => a.role === "subagent" && a.ended && !parents.has(a.key);
+  const folded = new Set<string>();
+  const groups = new Map<string, NodeAgent[]>();
+  for (const a of agents) if (leaf(a)) groups.set(a.parent ?? "", [...(groups.get(a.parent ?? "") ?? []), a]);
+  for (const list of groups.values()) for (const a of list.slice(0, Math.max(0, list.length - ENDED_KEPT))) folded.add(a.key);
+  const rows: TreeRow[] = [];
+  const told = new Set<string>();
+  for (const a of agents) {
+    if (!folded.has(a.key)) rows.push({ kind: "agent", key: a.key, depth: a.depth, agent: a });
+    else if (!told.has(a.parent ?? "")) {
+      told.add(a.parent ?? "");
+      rows.push({ kind: "more", key: `more:${a.key}`, depth: a.depth, count: groups.get(a.parent ?? "")!.length - ENDED_KEPT, parent: a.parent });
+    }
+  }
+  return rows;
 }
 
 // ── where a to-do stands ────────────────────────────────────
@@ -230,10 +360,35 @@ function reportedDone(todo: Todo): boolean {
   return !last || !sup.progress.at || Date.parse(last.at) < Date.parse(sup.progress.at);
 }
 
-/** The user's own words for a to-do, as its brief keeps them; else its title. */
-export function requestWords(todo: Pick<Todo, "title" | "brief">): { text: string; own: boolean } {
-  const words = todo.brief?.request?.text?.trim();
-  return words ? { text: words, own: true } : { text: todo.title, own: false };
+/** A line of a request to-do's notes that quotes the owner, as the main assistant writes it: `用户原话（<when>）：…`,
+ *  `原话：…`, `ユーザーの言葉：…`, `Your words: …`, `Owner's words (…): …`. Its text is the rest of the line (else the next
+ *  line that has any), outer quote marks taken off. */
+const QUOTE_LINE = /^\s*(?:(?:用户|用戶)?的?原[话話文]|(?:ユーザーの|ご本人の)?(?:原文|言葉)|(?:the\s+)?(?:owner'?s?|user'?s?|your|original|own)\s+words)\s*(?:[（(][^）)]*[）)])?\s*[:：]\s*(.*)$/i;
+const QUOTED = /^\s*[「“"『‘'](.*)[」”"』’']\s*$/s;
+
+/** The owner's words a to-do's notes quote (the first such line: the request as first said); "" when none does. */
+export function notesWords(notes: string | undefined | null): string {
+  const lines = (notes ?? "").split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const m = QUOTE_LINE.exec(lines[i]);
+    if (!m) continue;
+    const text = m[1].trim() || (lines.slice(i + 1).find((l) => l.trim()) ?? "").trim();
+    return (QUOTED.exec(text)?.[1] ?? text).trim();
+  }
+  return "";
+}
+
+/** The owner's own words for a to-do: as its brief keeps them (the hub's record), else as its notes quote them. */
+export function ownerWords(todo: Pick<Todo, "brief" | "notes">): string {
+  return todo.brief?.request?.text?.trim() || notesWords(todo.notes);
+}
+
+/** A request's heading from the sentence its work was filed under and the owner's words: the filed sentence, the words
+ *  quoted under it when they say something else; the words themselves when nothing was filed. */
+export function requestHeading(filed: string | undefined, said: string): { title: string; own: boolean; quote: string } {
+  const title = filed?.trim() ?? "";
+  if (!title) return { title: said, own: Boolean(said), quote: "" };
+  return { title, own: false, quote: said && !sameWords(said, title) ? said : "" };
 }
 
 /** When it was asked: the owner's message when the brief has it, else when the to-do was made. */
@@ -268,14 +423,15 @@ function todoNode(todo: Todo, data: GraphData, title?: string): GraphNode {
     : state === "needs_you" ? ms(ask?.asked_at) ?? ms(asking?.state_since)
     : state === "done" ? ms(todo.done_at)
     : ms(todo.created_at);
+  const agents = nodeAgents(todo, data);
   return {
     key: `todo:${todo.id}`, title: title || todo.title, todo, layer: 1, row: 0, after: [], waitsFor: [], waitsStart: false,
-    state, status, agents: nodeAgents(todo, data), ask: text, since,
+    state, status, agents, tree: agentTree(agents), ask: text, since,
   };
 }
 
 function planTaskNode(plan: TaskPlan, task: PlanTask, i: number): GraphNode {
-  return { key: `plan:${plan.id}/${i}`, title: task.title, task, layer: 1, row: 0, after: [], waitsFor: [], waitsStart: true, state: "queued", agents: [], ask: "", since: ms(plan.created_at) };
+  return { key: `plan:${plan.id}/${i}`, title: task.title, task, layer: 1, row: 0, after: [], waitsFor: [], waitsStart: true, state: "queued", agents: [], tree: [], ask: "", since: ms(plan.created_at) };
 }
 
 // ── layers ──────────────────────────────────────────────────
@@ -371,7 +527,7 @@ function finish(req: Omit<GraphRequest, "edges" | "layers" | "rows" | "done" | "
   const done = req.nodes.length > 0 && req.nodes.every((n) => n.state === "done") && (!req.root || isDoneTodo(req.root));
   const touched = Math.max(0, ms(req.plan?.created_at) ?? 0, ...todos.map((t) => ms(t.updated_at) ?? ms(t.created_at) ?? 0));
   const finished = Math.max(0, ...todos.map((t) => ms(t.done_at) ?? 0));
-  const merged = req.nodes.length === 1 && sameWords(req.words, req.nodes[0].title) && (!req.root || mergesWithRoot(req.root, req.nodes[0]));
+  const merged = req.nodes.length === 1 && sameWords(req.title, req.nodes[0].title) && (!req.root || mergesWithRoot(req.root, req.nodes[0]));
   return { ...req, edges: merged ? [] : edges, layers, rows, done, touched, finished, merged };
 }
 
@@ -455,22 +611,25 @@ export function buildGraph({ todos: all, plans, data }: GraphInput): Graph {
       for (const t of members) wants.set(`todo:${t.id}`, (t.after ?? []).map((id) => `todo:${id}`));
     }
     if (!nodes.length) continue;
-    let words: { text: string; own: boolean };
+    let heading: { title: string; own: boolean; quote: string };
     let at: string | undefined;
     if (g.kind === "parent" && g.root) {
-      words = requestWords(g.root);
+      // the request to-do's title, the owner's words (its brief, else its notes) under it
+      heading = requestHeading(g.root.title, ownerWords(g.root));
       at = requestedAt(g.root);
     } else if (g.kind === "plan") {
-      // the owner's words a plan's first task kept
+      // the owner's words a plan's first task kept; one task: its title is the heading, as for a lone to-do
       const said = g.plan?.tasks.find((task) => task.brief?.request?.text?.trim())?.brief?.request?.text?.trim() ?? "";
       const first = g.members[0];
-      words = said ? { text: said, own: true } : first ? requestWords(first) : { text: g.plan?.tasks[0]?.title ?? "", own: false };
+      const words = said || (first ? ownerWords(first) : "");
+      heading = nodes.length === 1 ? requestHeading(nodes[0].title, words)
+        : words ? { title: words, own: true, quote: "" } : requestHeading(first?.title ?? g.plan?.tasks[0]?.title, "");
       at = g.plan?.created_at || (first && requestedAt(first));
     } else {
-      words = requestWords(g.members[0]);
+      heading = requestHeading(g.members[0].title, ownerWords(g.members[0]));
       at = requestedAt(g.members[0]);
     }
-    out.push(finish({ key, kind: g.kind, words: words.text, own: words.own, at, root: g.root, plan: g.plan, nodes }, wants));
+    out.push(finish({ key, kind: g.kind, ...heading, at, root: g.root, plan: g.plan, nodes }, wants));
   }
   const active = out.filter((r) => !r.done).sort((a, b) => rank(a) - rank(b) || b.touched - a.touched || a.key.localeCompare(b.key));
   const done = out.filter((r) => r.done).sort((a, b) => b.finished - a.finished || a.key.localeCompare(b.key));
@@ -527,12 +686,31 @@ export const GAP_Y = 14;
 export const PAD = 10;
 /** A merged request's card: a piece's card with one more line on top, the request's label and time. */
 export const MERGED_H = CARD_H + 20;
+/** The root card's line quoting the owner's words under its heading. */
+export const ROOT_QUOTE_H = 24;
+/** A piece's Agent tree under its card: the line that names it and folds it (its top border included), an Agent's two
+ *  lines, a "more ended" line, and the room under the last line. */
+export const TREE_HEAD_H = 26;
+export const TREE_ROW_H = 34;
+export const TREE_MORE_H = 22;
+export const TREE_PAD = 6;
 const R = 8;
+
+/** How tall a piece's Agent tree is under its card, open or folded to its first line (0: no tree). */
+export function treeHeight(rows: readonly TreeRow[], open: boolean): number {
+  if (!rows.length) return 0;
+  return TREE_HEAD_H + (open ? rows.reduce((h, r) => h + (r.kind === "more" ? TREE_MORE_H : TREE_ROW_H), 0) + TREE_PAD : 0);
+}
+
+/** The root card's height: one more line when it quotes the owner. */
+export const rootHeight = (req: Pick<GraphRequest, "quote">) => CARD_H + (req.quote ? ROOT_QUOTE_H : 0);
 
 export interface Placed {
   key: string;
   x: number;
   y: number;
+  /** Its whole height, the Agent tree under it included. */
+  h: number;
 }
 
 export interface DrawnEdge extends GraphEdge {
@@ -550,7 +728,6 @@ export interface RequestLayout {
 }
 
 const colX = (c: number) => PAD + c * (CARD_W + GAP_X);
-const rowY = (r: number) => PAD + r * (CARD_H + GAP_Y);
 
 /** A polyline through `pts`, its corners rounded (never by more than half of either leg). */
 export function roundedPath(pts: [number, number][]): string {
@@ -570,19 +747,32 @@ export function roundedPath(pts: [number, number][]): string {
 }
 
 /**
- * Where everything of a request goes: the words in column 0, row 0; a node of layer L in column L at its row. An edge
- * leaves its source's right edge at mid height, turns in the gap right of it, and enters its target's left edge; one
- * that skips columns runs along the gutter between two rows (above its source when its target is higher, else
- * below), so it never crosses a card.
+ * Where everything of a request goes: the heading in column 0, row 0; a node of layer L in column L at its row. A row is
+ * as tall as its tallest card (a card with its Agent tree under it, `tree` giving the tree's height; the root with its
+ * quote). An edge leaves its source's right edge at the middle of the card's head (CARD_H), turns in the gap right of
+ * it, and enters its target's left edge the same way; one that skips columns runs along the gutter between two rows
+ * (above its source when its target is higher, else below), so it never crosses a card or a tree.
  */
-export function layoutRequest(req: Pick<GraphRequest, "nodes" | "edges" | "layers" | "rows"> & { merged?: boolean }): RequestLayout {
+export function layoutRequest(
+  req: Pick<GraphRequest, "nodes" | "edges" | "layers" | "rows"> & { merged?: boolean; quote?: string },
+  tree: (n: GraphNode) => number = () => 0,
+): RequestLayout {
   if (req.merged) {
-    // one card, in the words' place: no root, no connector
+    // one card, in the heading's place: no root, no connector
     const only = req.nodes[0];
-    return { root: { key: "root", x: PAD, y: PAD }, nodes: new Map([[only.key, { key: only.key, x: PAD, y: PAD }]]), edges: [], width: PAD * 2 + CARD_W, height: PAD * 2 + MERGED_H };
+    const h = MERGED_H + tree(only);
+    return { root: { key: "root", x: PAD, y: PAD, h: MERGED_H }, nodes: new Map([[only.key, { key: only.key, x: PAD, y: PAD, h }]]), edges: [], width: PAD * 2 + CARD_W, height: PAD * 2 + h };
   }
-  const nodes = new Map<string, Placed>(req.nodes.map((n) => [n.key, { key: n.key, x: colX(n.layer), y: rowY(n.row) }]));
-  const root: Placed = { key: "root", x: colX(0), y: rowY(0) };
+  const rows = Math.max(1, req.rows);
+  const heights = new Map(req.nodes.map((n) => [n.key, CARD_H + tree(n)]));
+  const rowH = Array.from({ length: rows }, (_, r) => Math.max(r === 0 ? rootHeight({ quote: req.quote ?? "" }) : CARD_H, ...req.nodes.filter((n) => n.row === r).map((n) => heights.get(n.key)!)));
+  const tops: number[] = [];
+  for (let r = 0, y = PAD; r < rows; r++) {
+    tops.push(y);
+    y += rowH[r] + GAP_Y;
+  }
+  const nodes = new Map<string, Placed>(req.nodes.map((n) => [n.key, { key: n.key, x: colX(n.layer), y: tops[n.row], h: heights.get(n.key)! }]));
+  const root: Placed = { key: "root", x: colX(0), y: tops[0], h: rootHeight({ quote: req.quote ?? "" }) };
   const rowOf = new Map(req.nodes.map((n) => [n.key, n.row]));
   const colOf = new Map(req.nodes.map((n) => [n.key, n.layer]));
   const edges: DrawnEdge[] = req.edges.map((e) => {
@@ -596,12 +786,11 @@ export function layoutRequest(req: Pick<GraphRequest, "nodes" | "edges" | "layer
     let pts: [number, number][];
     if (tc === sc + 1) pts = [[x1, y1], [gapOut, y1], [gapOut, y2], [x2, y2]];
     else {
-      const gutter = tr < sr ? rowY(sr) - GAP_Y / 2 : rowY(sr) + CARD_H + GAP_Y / 2;
+      const gutter = tr < sr ? tops[sr] - GAP_Y / 2 : tops[sr] + rowH[sr] + GAP_Y / 2;
       pts = [[x1, y1], [gapOut, y1], [gapOut, gutter], [gapIn, gutter], [gapIn, y2], [x2, y2]];
     }
     return { ...e, d: roundedPath(pts), dot: [x1, y1] };
   });
   const cols = Math.max(1, req.layers + 1);
-  const rows = Math.max(1, req.rows);
-  return { root, nodes, edges, width: colX(cols - 1) + CARD_W + PAD, height: rowY(rows - 1) + CARD_H + PAD };
+  return { root, nodes, edges, width: colX(cols - 1) + CARD_W + PAD, height: tops[rows - 1] + rowH[rows - 1] + PAD };
 }
