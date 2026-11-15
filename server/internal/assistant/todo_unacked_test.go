@@ -59,17 +59,18 @@ func TestUnackedDecisionsRoute(t *testing.T) {
 	}
 	open, done := create("Fix the widget"), create("Ship the release")
 	ctx := context.Background()
-	write := func(id, todo, source, question string) {
+	// Distinct times, newest last, given rather than waited for; all before now, so the owner's answers below are later.
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	write := func(n int, id, todo, source, question string) {
 		if _, err := database.InsertTodoDecision(ctx, db.TodoDecisionRow{ID: id, TodoID: todo, Question: question, Choice: "A",
-			Source: source, CreatedAt: time.Now().UTC()}); err != nil {
+			Source: source, CreatedAt: base.Add(time.Duration(n) * time.Second)}); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(2 * time.Millisecond) // distinct times, newest last
 	}
-	write("dec_a", open, db.DecisionAgent, "Which branch?")
-	write("dec_b", open, db.DecisionOutcome, "Where do retries go?")
-	write("dec_c", open, db.DecisionManual, "Which port?")
-	write("dec_d", done, db.DecisionAgent, "Which icon?")
+	write(1, "dec_a", open, db.DecisionAgent, "Which branch?")
+	write(2, "dec_b", open, db.DecisionOutcome, "Where do retries go?")
+	write(3, "dec_c", open, db.DecisionManual, "Which port?")
+	write(4, "dec_d", done, db.DecisionAgent, "Which icon?")
 	e.must("PATCH", "/api/v1/todos/"+done, `{"done":true}`)
 
 	ids := func() []string {
