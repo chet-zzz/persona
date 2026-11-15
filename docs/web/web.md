@@ -53,9 +53,9 @@ entries held, plus the tasks Progress used to rank first and the hand-opened Age
 open tasks and the hand-opened working Agents, which replaces the Agents entry. Finished tasks fold nowhere: the board has
 them. A task waiting for its supervisor's review is in neither: **Persona reviewing** (#8678), an entry after In progress
 shown only while such a task waits, drawn neutral (grey `ink-3` dot, `ink-2` label) since nothing in it is the user's,
-lists it whatever the age of the review, with "Supervisor reviewing" on each row (`entries.review`; unified-entry.md "A
-supervisor's review is not the owner's"). The rest of this section describes the earlier three entries; the counting rule
-still holds for In progress.
+lists it whatever the age of the review, with "Supervisor reviewing" on each row (`entries.review`;
+unified-entry.md "Needs you and In progress: each thing once (#3387)"). The rest of this section describes the earlier three
+entries; the counting rule still holds for In progress.
 
 Progress lists and counts the conversation's open tasks by **the To-dos page's rule** (#3331, `todoBucket` in
 `web/src/lib/todo-triage.ts`, the same `countsAsOpen` as the page's "Not done"): working, waiting for the user, finished but
