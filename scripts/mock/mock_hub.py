@@ -1067,6 +1067,7 @@ if os.environ.get("MOCK_SHARED_FOLDER") == "1":
     SESSIONS += [
         _desktop("a1f3c2d4-0000-4000-8000-00000000571%d" % i, title, *(("done", "unread") if i == 1 else ("idle", "idle")),
                  40 + 20 * i, last, repo_root=_atlas, source_kind="claude_desktop",
+                 space_kind="claude_desktop", space_id="codex-project:" + _atlas, space_name="atlas",  # its project (#8521)
                  **({} if i == 1 else {"seen_at": ago(minutes=30 + 20 * i)}))
         for i, (title, last) in enumerate([("地图瓦片缓存", "瓦片缓存改成按缩放级别分目录了。"),
                                            ("离线包大小评估", "离线包压到 180 MB，列了三种取舍。"),
@@ -1543,7 +1544,8 @@ if os.environ.get("MOCK_SOURCES"):
         # messages through its peer inbox, one in another terminal whose inbox the node cannot use.
         sess("server", CLAUDE_DESKTOP, "整理发布说明", "/home/me/code/release", "working", "working", "", 0, "", 0, 1,
              "把这周合并的 PR 按模块分好了，正在写摘要。", agent="claude", source_kind="claude_desktop",
-             capabilities=_desktop_caps, **NO_SPACE),
+             capabilities=_desktop_caps, **dict(NO_SPACE, space_kind="claude_desktop",
+                                                 space_id="codex-project:/home/me/code/release", space_name="release")),
         sess("server", CLAUDE_TERMINAL, "排查构建缓存", "/home/me/code/build", "idle", "idle", "", 0, "", 0, 12,
              "缓存键里少了 Go 版本，已经补上。", agent="claude", source_kind="claude_cli",
              read_only_reason="这个 Claude 没有开放会话之间的消息通道（版本较旧或功能关着）：手机上只能看，回复请在电脑上",
@@ -1746,8 +1748,11 @@ if os.environ.get("MOCK_DESKTOP_APPS"):
             kw.update(space_kind="codex_app", space_id=f"codex-project:{cwd}", space_name=cwd.rsplit("/", 1)[-1],
                       agent_name="Codex App", source_kind="codex_history", capabilities={"read": True, "send": True},
                       efforts=["low", "medium", "high", "xhigh", "max", "ultra"], effort="max")
-        elif surface == "desktop" and status != "offline":
-            kw.update(source_kind="claude_desktop", capabilities=_desktop_caps)  # a live one, through its peer inbox
+        elif surface == "desktop":
+            if status != "offline":
+                kw.update(source_kind="claude_desktop", capabilities=_desktop_caps)  # a live one, through its peer inbox
+            if project:  # in its project, as the app's sidebar groups it; the home directory's in none (#8521)
+                kw.update(space_kind="claude_desktop", space_id=f"codex-project:{cwd}", space_name=cwd.rsplit("/", 1)[-1])
         SESSIONS.append(sess("macbook", sid, title, cwd, status, state, "", 0, "", 0, mins,
                              "好的，我先看一下。", agent=agent, **kw))
     # The CSV chat's subagents (thread_spawn): the node lists each with its chat (codex_registry.go); the Agents list puts
@@ -17928,10 +17933,10 @@ def session_catalog(rows, revision, state_of):
     waiting = lambda n: {"needs_you": n} if n else {}
     for s in rows:
         needs = 1 if state_of(s) == "needs_you" else 0
-        path = s.get("repo_root") or s.get("workspace_cwd") or s.get("cwd", "")
+        path = s.get("repo_root") or s.get("workspace_cwd") or s.get("cwd") or ""
         at = places.setdefault((s["machine_id"], path), [0, 0])
         at[0] += 1; at[1] += needs
-        group = s.get("space_id") or s.get("workspace_id", "")
+        group = s.get("space_id") or s.get("workspace_id") or ""  # a row may name none as null (NO_SPACE)
         at = groups.setdefault((s["machine_id"], group), [0, 0])
         at[0] += 1; at[1] += needs
         if group and s.get("space_name"):
@@ -24613,7 +24618,7 @@ MOCK_HELP = [
     "MOCK_HISTORY=1  很长的 Persona 对话历史（最近 30 个 + 查看全部）、一段交接对话、一个置顶，置顶写入会保存",
     "MOCK_MODELS_SECONDS=<秒>  新建 Agent 里列一个启动器的模型要多久（默认 0.8，CLI 起来回答的时间）",
     "MOCK_REPLY_CUT=1|error  The review chat's last turn stopped right after its first words (interrupted; =error: a model API error): its reply says it did not complete (#5314)",
-    "MOCK_LN=1  Low-distraction mode on (#7782); GET /mock/ln?on=0|1 switches it until /mock/reset. Either way /api/v1/push/intercepts has two P1 pushes and one P2 push held today, the first linking the /orders investigation to-do (todo_id), and one of yesterday that clients leave out",
+    "MOCK_LN=1  Low-distraction mode on (#7782); GET /mock/ln?on=0|1 or the apps' PUT /api/v1/push/ln-mode (#8157) switches it until /mock/reset. Either way /api/v1/push/intercepts has two P1 pushes and one P2 push held today, the first linking the /orders investigation to-do (todo_id), and one of yesterday that clients leave out",
 ]
 
 _features_without_voice = features
@@ -27723,6 +27728,9 @@ class H(BaseHTTPRequestHandler):
                 if st["key"] == body.get("key"):
                     st["value"] = body.get("value")
             return self.send_json({"settings": store[mid]})
+        if p == "/api/v1/push/ln-mode" and self.command == "PUT":  # Settings › Notifications › Low-distraction mode (#8157)
+            LN["on"] = json.loads(self.last_body or b"{}").get("enabled") is True
+            return self.send_json({"enabled": LN["on"]})
         if p.startswith("/api/v1/devices/") and p.endswith("/prefs"):  # Settings › Notifications
             body = json.loads(self.last_body or b"{}")
             PREFS.update({k: v for k, v in body.items() if k in ("input", "done", "live_activity", "lock_details")})
