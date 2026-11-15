@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/nwverse/persona/server/internal/compat"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -115,6 +116,11 @@ type Todo struct {
 	SeenAt *time.Time `json:"seen_at,omitempty"`
 	// InboxItem is the Inbox row it was made from (#6480); the to-do's page opens that row. Empty for any other to-do.
 	InboxItem string `json:"inbox_item,omitempty"`
+	// PartOf: the to-do whose request this one is a piece of; After: the pieces of that request it waits for
+	// (todo_pieces.go, docs/assistant/todos.md "Requests in pieces"). Both empty for a to-do that is no piece. Clients
+	// that do not know them show the to-do as ever.
+	PartOf string   `json:"part_of,omitempty"`
+	After  []string `json:"after,omitempty"`
 	// Brief: what was asked when the work was handed out, with its log, and Lineage: the to-dos that carried the work
 	// (#3822, task_brief.go). Filled in where the apps read the to-dos (withBrief); absent for a to-do with no brief.
 	Brief   *TaskBrief    `json:"brief,omitempty"`
@@ -577,6 +583,7 @@ func copyTodoLocked(t *Todo) Todo {
 	}
 	out.Spaces = make([]TodoSpace, len(t.Spaces))
 	copy(out.Spaces, t.Spaces)
+	out.After = slices.Clone(t.After)
 	out.Agents = make([]TodoAgent, len(t.Agents))
 	for i, a := range t.Agents {
 		out.Agents[i] = a
@@ -908,7 +915,8 @@ func (s *Service) todoRoutes() {
 		apierr.WriteJSON(w, map[string]any{"todo": resTodo})
 	})
 
-	// PATCH /api/v1/todos/{id}: update title, notes, done, due_at | due_date, remind_at, priority, project ("" clears it)
+	// PATCH /api/v1/todos/{id}: update title, notes, done, due_at | due_date, remind_at, priority, project ("" clears it),
+	// part_of ("" clears it) and after ([] clears it), checked as todo_pieces.go says
 	s.handle("PATCH /api/v1/todos/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if !todoWriter(r) {
 			apierr.Write(w, http.StatusForbidden, errors.New("read-only role cannot modify todos"))
@@ -919,16 +927,19 @@ func (s *Service) todoRoutes() {
 			return
 		}
 		id := r.PathValue("id")
-		if _, ok := s.todoNow(id); !ok {
+		cur, ok := s.todoNow(id)
+		if !ok {
 			apierr.Write(w, http.StatusNotFound, errors.New("todo not found"))
 			return
 		}
 
 		var in struct {
-			Title   *string `json:"title"`
-			Notes   *string `json:"notes"`
-			Done    *bool   `json:"done"`
-			Project *string `json:"project"`
+			Title   *string         `json:"title"`
+			Notes   *string         `json:"notes"`
+			Done    *bool           `json:"done"`
+			Project *string         `json:"project"`
+			PartOf  json.RawMessage `json:"part_of"`
+			After   json.RawMessage `json:"after"`
 			todoPlanIn
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -952,6 +963,19 @@ func (s *Service) todoRoutes() {
 			apierr.Write(w, http.StatusBadRequest, err)
 			return
 		}
+		pieces, err := pieceArgs(in.PartOf, in.After)
+		if err == nil && pieces.set() && cur.isConcern() {
+			err = errors.New("a concern is no piece of a request")
+		}
+		var links db.TodoEdit
+		if err == nil {
+			links, err = s.checkPieces(id, cur, pieces)
+		}
+		if err != nil {
+			apierr.Write(w, http.StatusBadRequest, err)
+			return
+		}
+		e.PartOf, e.After = links.PartOf, links.After
 		resTodo, err := s.editTodo(r.Context(), id, e)
 		if err != nil {
 			if errors.Is(err, db.ErrTodoNotFound) {

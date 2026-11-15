@@ -34,6 +34,7 @@ func (t *Todo) setPlan(row db.TodoRow) {
 	t.Kind = row.Kind
 	t.SeenAt = row.SeenAt
 	t.InboxItem = row.InboxItem
+	t.PartOf, t.After = row.PartOf, slices.Clone(row.After)
 }
 
 // keepPlan writes t's plan, project and seen mark into row: a row made in memory for a change that is not to them keeps
@@ -48,6 +49,7 @@ func (t *Todo) keepPlan(row *db.TodoRow) {
 	row.Kind = t.Kind
 	row.SeenAt = t.SeenAt
 	row.InboxItem = t.InboxItem
+	row.PartOf, row.After = t.PartOf, slices.Clone(t.After)
 }
 
 // todoRowOf is todo t as a row (what memory has of it; the store-less PATCH changes it).
@@ -203,6 +205,19 @@ func (s *Service) createDirectionTodo(ctx context.Context, leader, title, notes 
 		t = cur
 	}
 	return t, nil
+}
+
+// createPieceTodo makes a piece of a request that conversation will hand out itself (todo_pieces.go): a to-do with
+// plan's links, opened by that conversation, with no agent, so that its task_plan's todo_id can run an Agent on it when
+// its turn comes (reusableTodo) instead of opening a second to-do. Unlike a leader's piece (createDirectionTodo) it is
+// not supervised until an Agent works on it: the plan that starts it sets that up.
+func (s *Service) createPieceTodo(ctx context.Context, conversation, title, notes string, plan db.TodoEdit) (Todo, error) {
+	now := time.Now().UTC()
+	row := db.TodoRow{ID: "todo_" + randomHex(8), Title: title, Notes: notes, CreatedAt: now, UpdatedAt: now,
+		Origin: conversation, Quiet: s.quietTask(ctx, conversation)}
+	plan.Title, plan.Notes, plan.Done = nil, nil, nil
+	plan.Apply(&row, now)
+	return s.insertTodo(ctx, row)
 }
 
 // editTodo makes edit e to todo id as the user's PATCH does: stored, put into memory, the apps and the hub told; a
