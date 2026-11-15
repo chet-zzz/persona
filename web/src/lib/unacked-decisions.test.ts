@@ -2,7 +2,7 @@
 // The Overview group's pure parts: the bodies of "I agree" / "No, change it", and the manager's list grouped by to-do.
 // Which decisions wait is the manager's rule (server/internal/assistant/todo_unacked_test.go).
 import { describe, expect, it } from "vitest";
-import { ackBody, groupByTodo, overruleBody } from "./unacked-decisions";
+import { ackBody, groupByTodo, listsUnacked, overruleBody } from "./unacked-decisions";
 import type { TodoDecision } from "./todos";
 
 const at = (m: number) => new Date(Date.UTC(2026, 10, 14, 10, m)).toISOString();
@@ -14,6 +14,13 @@ describe("not acknowledged", () => {
     const d = decision("d1", "t", { question: "Branch?", choice: "fix/a" });
     expect(ackBody(d)).toEqual({ question: "Branch?", choice: "fix/a", supersedes_id: "d1" });
     expect(overruleBody(d, " main ", " keep it simple ")).toEqual({ question: "Branch?", choice: "main", reason: "keep it simple", supersedes_id: "d1" });
+  });
+
+  it("may list an open to-do's calls and a concern's its report closed, never another closed to-do's", () => {
+    expect(listsUnacked({ done_at: null })).toBe(true);
+    expect(listsUnacked({ done_at: at(2), kind: "concern", done_by: "reported" })).toBe(true);
+    expect(listsUnacked({ done_at: at(2) })).toBe(false);
+    expect(listsUnacked({ done_at: at(2), done_by: "reported" })).toBe(false);
   });
 
   it("groups the newest-first list by to-do, the to-do with the latest call first, leaving out to-dos the page does not list", () => {

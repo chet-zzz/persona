@@ -1,12 +1,12 @@
 // What the Overview's "Decided for you, not acknowledged" group reads (views/HomeUnacked.tsx): the model's decisions on
-// open to-dos that the owner has not acknowledged. Which ones wait is the manager's rule
+// open to-dos, and the reports of concerns they closed, that the owner has not acknowledged. Which ones wait is the manager's rule
 // (server/internal/assistant/todo_unacked.go, docs/assistant/todos.md "Decisions made for you"), behind one route,
 // GET /todos/decisions/unacked; this file only reads it and writes the owner's answers.
-//   - read once when the group mounts, and again (at most every few hundred ms) when an open to-do changes: the hub
-//     bumps a to-do's `updated_at` whenever a decision is written, so the open to-dos' stamps say when to read;
+//   - read once when the group mounts, and again (at most every few hundred ms) when a to-do it may list changes: the
+//     hub bumps a to-do's `updated_at` whenever a decision is written, so those to-dos' stamps say when to read;
 //   - a manager without the route (its route-level 404) is asked once, and the group then shows nothing.
 import { api } from "./api";
-import { isLegacySpacesRouteError, type TodoDecision } from "./todos";
+import { isLegacySpacesRouteError, type Todo, type TodoDecision } from "./todos";
 
 const SETTLE_MS = 400;
 
@@ -70,6 +70,12 @@ export class UnackedFeed {
     this.state = s;
     this.onState(s);
   }
+}
+
+/** Whether the group may list a call of to-do td: an open one, or a concern its report closed, whose report waits
+ *  (which calls of it wait is the manager's rule, server/internal/assistant/todo_unacked.go waitsOn). */
+export function listsUnacked(td: Pick<Todo, "done_at" | "kind" | "done_by">): boolean {
+  return !td.done_at || (td.kind === "concern" && td.done_by === "reported");
 }
 
 /** The decisions grouped by to-do, the to-do with the latest call first, each group newest first (as the route gives

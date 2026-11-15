@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/nwverse/persona/server/internal/apierr"
 	"github.com/nwverse/persona/server/internal/db"
@@ -17,6 +18,10 @@ import (
 
 // unackedLimit bounds the answer: the newest calls are the ones that can still change the work.
 const unackedLimit = 200
+
+// reportedWait is how long a concern's report waits after the report closed it: what the owner was told in the chat is
+// worth taking as theirs while it is fresh, and the concerns reported before this list existed do not all come back.
+const reportedWait = 7 * 24 * time.Hour
 
 // ownersDecision: a source that is the owner's own call (written by hand, an answer to an Agent's question card, said
 // in the to-do's chat thread). Any other source, one this hub does not know included, is a model's: what nobody can
@@ -71,10 +76,21 @@ func unackedDecisions(all []db.TodoDecisionRow) []db.TodoDecisionRow {
 	return out
 }
 
+// waitsOn: decision d of t, one of unackedDecisions, is listed. On a to-do or a task, while it is open and not
+// cancelled (closed, nothing is left to change). On a concern, only its report, and only while that report keeps it
+// closed: latest is the concern's newest report, and its close is at most reportedWait old. An open concern's earlier
+// report is not listed: reopening it said the answer was not enough, and the next report is what will wait.
+func waitsOn(t Todo, d db.TodoDecisionRow, latest string, now time.Time) bool {
+	if !t.isConcern() {
+		return t.DoneAt == nil && !t.Cancelled()
+	}
+	return d.Source == db.DecisionReported && d.ID == latest && t.DoneAt != nil && t.DoneBy == db.DoneByReported &&
+		!t.DoneAt.Before(now.Add(-reportedWait))
+}
+
 func (s *Service) todoUnackedRoutes() {
-	// GET /api/v1/todos/decisions/unacked: the model's decisions on open to-dos the owner has not acknowledged, newest
-	// first, at most unackedLimit → {"decisions": [Decision]}. A concern's or a cancelled to-do's are left out: nothing
-	// is left to change there.
+	// GET /api/v1/todos/decisions/unacked: the model's decisions the owner has not acknowledged, newest first, at most
+	// unackedLimit → {"decisions": [Decision]}: on the open to-dos, and the report of each concern it closed (waitsOn).
 	s.handle("GET /api/v1/todos/decisions/unacked", func(w http.ResponseWriter, r *http.Request) {
 		st := s.todoDB()
 		if st == nil {
@@ -85,15 +101,21 @@ func (s *Service) todoUnackedRoutes() {
 			apierr.Write(w, http.StatusServiceUnavailable, errTodosUnavailable)
 			return
 		}
-		all, err := st.OpenTodoDecisions(r.Context())
+		now := time.Now()
+		all, err := st.OpenTodoDecisions(r.Context(), now.Add(-reportedWait))
 		if err != nil {
 			apierr.Write(w, http.StatusInternalServerError, err)
 			return
 		}
+		latest := map[string]string{} // each concern's newest report (all is oldest first)
+		for _, d := range all {
+			if d.Source == db.DecisionReported {
+				latest[d.TodoID] = d.ID
+			}
+		}
 		out := []db.TodoDecisionRow{}
 		for _, d := range unackedDecisions(all) {
-			t, ok := s.todoNow(d.TodoID)
-			if !ok || t.DoneAt != nil || t.Cancelled() || t.isConcern() {
+			if t, ok := s.todoNow(d.TodoID); !ok || !waitsOn(t, d, latest[d.TodoID], now) {
 				continue
 			}
 			if out = append(out, d); len(out) == unackedLimit {

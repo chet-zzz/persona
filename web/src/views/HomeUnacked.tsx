@@ -1,5 +1,5 @@
-// The Overview's "Decided for you, not acknowledged" group (lib/unacked-decisions.ts): across the open to-dos, the model's
-// calls the user has not acknowledged, with "I agree" / "No, change it" in place. Which calls wait is the manager's
+// The Overview's "Decided for you, not acknowledged" group (lib/unacked-decisions.ts): across the open to-dos (and the
+// concerns a report closed), the model's calls the user has not acknowledged, with "I agree" / "No, change it" in place. Which calls wait is the manager's
 // rule, read in one request (GET /todos/decisions/unacked). Home loads this chunk after its first paint; it draws
 // nothing while there is nothing to acknowledge.
 //
@@ -12,7 +12,7 @@ import { errorText } from "../lib/api";
 import { useScopedTodos } from "../lib/current-assistant";
 import { href, onLinkClick, type Route } from "../lib/router";
 import { addTodoDecision, type Todo, type TodoDecision } from "../lib/todos";
-import { ackBody, groupByTodo, overruleBody, UNACKED_FIRST, UnackedFeed, type UnackedState } from "../lib/unacked-decisions";
+import { ackBody, groupByTodo, listsUnacked, overruleBody, UNACKED_FIRST, UnackedFeed, type UnackedState } from "../lib/unacked-decisions";
 import { Button, cx, toast } from "../ui/atoms";
 import { Icon } from "../ui/icons";
 import { Group } from "./Home";
@@ -35,8 +35,8 @@ function useUnacked(): { feed: UnackedFeed | null; groups: UnackedGroup[] } {
     made.refresh(true);
     return () => made.close();
   }, []);
-  // a decision written anywhere moves its to-do's updated_at: the open to-dos' stamps say when to read again
-  const stamp = useMemo(() => todos.filter((td) => !td.done_at).map((td) => td.id + "@" + td.updated_at).join(","), [todos]);
+  // a decision written anywhere moves its to-do's updated_at: the stamps of the to-dos it may list say when to read again
+  const stamp = useMemo(() => todos.filter(listsUnacked).map((td) => td.id + "@" + td.updated_at).join(","), [todos]);
   const seen = useRef(stamp);
   useEffect(() => {
     if (!feed || seen.current === stamp) return;
@@ -44,7 +44,7 @@ function useUnacked(): { feed: UnackedFeed | null; groups: UnackedGroup[] } {
     feed.refresh();
   }, [feed, stamp]);
   const groups = useMemo(() => {
-    const byId = new Map(todos.filter((td) => !td.done_at).map((td) => [td.id, td]));
+    const byId = new Map(todos.filter(listsUnacked).map((td) => [td.id, td]));
     return groupByTodo(state.decisions, (id) => byId.has(id)).map(({ todoId, list }) => ({ todo: byId.get(todoId)!, list }));
   }, [state, todos]);
   return { feed, groups };

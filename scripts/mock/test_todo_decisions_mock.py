@@ -108,6 +108,33 @@ class TodoDecisionsMockTests(unittest.TestCase):
         self.assertEqual((code, body["code"], body["error"]), (404, "not_found", "todo not found"))
 
 
+class UnackedDecisionsMockTests(unittest.TestCase):
+    """GET /api/v1/todos/decisions/unacked as server/internal/assistant/todo_unacked.go answers it (#8535)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hub = MockHub(MOCK_TASKS="1", MOCK_AGENT_DECISIONS="1", MOCK_TODO_CONCERNS="1")
+        cls.addClassCleanup(cls.hub.stop)
+
+    def setUp(self):
+        self.hub.request("/mock/reset")
+
+    def ids(self):
+        return [d["id"] for d in self.hub.request("/api/v1/todos/decisions/unacked")["decisions"]]
+
+    def test_the_model_s_calls_and_a_concern_s_report_wait(self):
+        got = self.ids()
+        self.assertIn("dec_concern_report", got, "the report of a concern it closed waits")
+        self.assertIn("dec_ag_branch", got)
+        self.assertNotIn("dec_ag_font", got, "the owner already replaced it")
+        self.assertNotIn("dec_me_font", got, "the owner's own call")
+
+    def test_i_agree_on_the_report_takes_it_off(self):
+        self.hub.request("/api/v1/todos/todo_concern_closed/decisions", "POST", {"question": "Is the nightly backup covered?",
+                         "choice": "The nightly backup is already covered.", "supersedes_id": "dec_concern_report"})
+        self.assertNotIn("dec_concern_report", self.ids())
+
+
 class LegacyHubDecisionsMockTests(unittest.TestCase):
     def test_a_hub_from_before_decisions_has_no_route(self):
         hub = MockHub(MOCK_LEGACY_HUB="1")

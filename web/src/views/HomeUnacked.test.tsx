@@ -83,6 +83,21 @@ describe("the unacknowledged decisions group", () => {
     expect(host.innerHTML).toBe("");
   });
 
+  it("lists a concern's report while that report keeps it closed, and 'I agree' takes it as the user's", async () => {
+    const title = "Is the nightly backup covered?";
+    hub.todos = [todo("c1", { title, kind: "concern", done_at: at(3), done_by: "reported" })];
+    hub.unacked = [decision("r1", "reported", { todo_id: "c1", question: title, choice: "Yes, every night at 2:00" })];
+    await mount();
+    const group = host.querySelector('[data-unacked-group="c1"]')!;
+    expect(group.textContent).toContain(title);
+    expect(group.textContent).toContain("Yes, every night at 2:00");
+    act(() => group.querySelector<HTMLButtonElement>("button[aria-expanded]")!.click());
+    expect(group.querySelector("[data-decision-more]")!.textContent).toContain("What the main conversation told you");
+    await act(async () => group.querySelector<HTMLButtonElement>('[data-testid="decision-ack"]')!.click());
+    await settle();
+    expect(hub.written).toEqual([["c1", { question: title, choice: "Yes, every night at 2:00", supersedes_id: "r1" }]]);
+  });
+
   it("'No, change it' asks for the user's own choice and why, then writes them replacing the call", async () => {
     hub.todos = [todo("t1")];
     hub.unacked = [decision("d1", "agent")];
