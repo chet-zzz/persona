@@ -231,7 +231,21 @@ func (s *Service) editTodo(ctx context.Context, id string, e db.TodoEdit) (Todo,
 	if cur.isConcern() && cur.DoneAt == nil && e.Done != nil && *e.Done {
 		return Todo{}, db.ErrConcernUnreported // only its report closes it (concerns.go); the store checks it again
 	}
+	links := e.PartOf != nil || e.After != nil
+	if f := s.pieceWriteHook; links && f != nil {
+		f(id)
+	}
 	s.todos.writing.Lock()
+	if links {
+		// Checked again with the graph held still: a write since the caller's check may have changed the request
+		// (todo_pieces.go). A *pieceError when it no longer holds.
+		l, err := s.recheckPieces(id, e)
+		if err != nil {
+			s.todos.writing.Unlock()
+			return Todo{}, err
+		}
+		e.PartOf, e.After = l.PartOf, l.After
+	}
 	now := time.Now().UTC()
 	var row *db.TodoRow
 	if st := s.todoDB(); st != nil {
@@ -241,7 +255,11 @@ func (s *Service) editTodo(ctx context.Context, id string, e db.TodoEdit) (Todo,
 			return Todo{}, err
 		}
 	} else {
-		r := todoRowOf(cur)
+		base := cur
+		if fresh, ok := s.todoNow(id); ok {
+			base = fresh // as the writes before this one left it, not as it was before the lock
+		}
+		r := todoRowOf(base)
 		e.Apply(&r, now)
 		row = &r
 	}

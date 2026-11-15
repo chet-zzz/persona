@@ -283,7 +283,7 @@ func (s *Service) toolTodoCreate(ctx context.Context, machine, self string, args
 	if pieces.set() && kind == db.KindConcern {
 		return "", errors.New("a concern is no piece of a request: leave part_of and after out")
 	}
-	links, err := s.checkPieces("", Todo{}, pieces)
+	links, err := s.checkPieces("", pieces)
 	if err != nil {
 		return "", err
 	}
@@ -386,7 +386,7 @@ func (s *Service) toolTodoUpdate(ctx context.Context, machine, self string, args
 	if pieces.set() && t.isConcern() {
 		return "", errors.New("a concern is no piece of a request: leave part_of and after out")
 	}
-	links, err := s.checkPieces(t.ID, t, pieces)
+	links, err := s.checkPieces(t.ID, pieces)
 	if err != nil {
 		return "", err
 	}

@@ -185,7 +185,8 @@ type todoBook struct {
 	// memory takes the rows in the order the store committed them: two devices writing the same todo at once
 	// otherwise leave memory with whichever finished last, not the newer row. Every writer that puts a stored row
 	// into memory takes it. Workspace ownership writes and deletion also take it through publication; fanout
-	// rechecks ownership under it after session lookup. Automatic links take it for memory changes and again for background persistence, so a
+	// rechecks ownership under it after session lookup. A write of part_of or after checks the request graph again
+	// under it before storing (todo_pieces.go). Automatic links take it for memory changes and again for background persistence, so a
 	// removed workspace cannot gain a late stored agent. Agent snapshots do not take it. Taken before mu, never
 	// while mu is held; node calls and change notifications run after it is released.
 	writing         sync.Mutex
@@ -549,6 +550,38 @@ func (s *Service) insertTodo(ctx context.Context, row db.TodoRow) (Todo, error) 
 	if err := s.ensureTodosLoaded(ctx); err != nil {
 		return Todo{}, err
 	}
+	var out Todo
+	var err error
+	if row.PartOf != "" || len(row.After) > 0 {
+		out, err = s.insertPiece(ctx, row)
+	} else {
+		out, err = s.putNewTodo(ctx, row)
+	}
+	if err != nil {
+		return Todo{}, err
+	}
+	s.todosChanged(ctx)
+	return out, nil
+}
+
+// insertPiece is putNewTodo for a piece of a request: its links checked again and the row stored with todoBook.writing
+// held, as editTodo writes them (todo_pieces.go).
+func (s *Service) insertPiece(ctx context.Context, row db.TodoRow) (Todo, error) {
+	if f := s.pieceWriteHook; f != nil {
+		f(row.ID)
+	}
+	s.todos.writing.Lock()
+	defer s.todos.writing.Unlock()
+	e, err := s.recheckPieces("", db.TodoEdit{PartOf: &row.PartOf, After: &row.After})
+	if err != nil {
+		return Todo{}, err
+	}
+	row.PartOf, row.After = *e.PartOf, *e.After
+	return s.putNewTodo(ctx, row)
+}
+
+// putNewTodo is insertTodo's store write and memory, without telling anyone.
+func (s *Service) putNewTodo(ctx context.Context, row db.TodoRow) (Todo, error) {
 	if st := s.todoDB(); st != nil {
 		if err := st.CreateTodo(ctx, row); err != nil {
 			return Todo{}, err
@@ -562,7 +595,6 @@ func (s *Service) insertTodo(ctx context.Context, row db.TodoRow) (Todo, error) 
 	s.todos.todos[id] = tObj
 	out := formatTodo(copyTodoLocked(tObj))
 	s.todos.mu.Unlock()
-	s.todosChanged(ctx)
 	return out, nil
 }
 
@@ -971,7 +1003,7 @@ func (s *Service) todoRoutes() {
 		}
 		var links db.TodoEdit
 		if err == nil {
-			links, err = s.checkPieces(id, cur, pieces)
+			links, err = s.checkPieces(id, pieces)
 		}
 		if err != nil {
 			apierr.Write(w, http.StatusBadRequest, err)
@@ -984,6 +1016,8 @@ func (s *Service) todoRoutes() {
 				apierr.Write(w, http.StatusNotFound, err)
 			} else if errors.Is(err, db.ErrConcernUnreported) {
 				apierr.Write(w, http.StatusConflict, err) // report its outcome instead: POST …/decisions {source: "reported"}
+			} else if pe := (*pieceError)(nil); errors.As(err, &pe) {
+				apierr.Write(w, http.StatusBadRequest, err) // another write changed the request since it was checked
 			} else {
 				apierr.Write(w, http.StatusInternalServerError, err)
 			}

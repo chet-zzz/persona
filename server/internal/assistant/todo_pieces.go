@@ -22,6 +22,11 @@ import (
 // cycle. Neither is a foreign key: a deleted to-do leaves an id behind, which the readers skip and the next write of
 // that list drops.
 //
+// Each writer checks a change first, to answer with what is wrong before asking or writing anything, and the write
+// itself checks it again while holding todoBook.writing (editTodo, insertTodo), against the to-dos as every earlier
+// write left them: two writes that each pass against the graph the other is about to change (A after B and B after A at
+// once) can't both be stored.
+//
 // Nothing here decides when work is split or started: that is the conversation's (its instructions, an extension).
 
 // pieceEdit is a change to a to-do's place in a request; nil leaves that part as it is. Changing part_of without
@@ -38,13 +43,31 @@ func (p pieceEdit) set() bool {
 	return p.PartOf != nil && strings.TrimSpace(*p.PartOf) != "" || p.After != nil && len(*p.After) > 0
 }
 
-// checkPieces checks edit p of to-do id (cur its links now; id "" for a to-do not made yet, which nothing can name
-// yet) against the to-dos as they are, and returns the change to write: trimmed, without repeats, nil fields left as
-// they are. The error says what is wrong in words a model and a person can act on.
-func (s *Service) checkPieces(id string, cur Todo, p pieceEdit) (db.TodoEdit, error) {
-	var out db.TodoEdit
+// pieceError is a change to part_of or after the manager refuses (checkPieces): the caller's to fix, not the store's.
+type pieceError struct{ error }
+
+// checkPieces checks edit p of to-do id (id "" for a to-do not made yet, which nothing can name yet) against the to-dos
+// as they are, and returns the change to write: trimmed, without repeats, nil fields left as they are. The error, a
+// *pieceError, says what is wrong in words a model and a person can act on.
+func (s *Service) checkPieces(id string, p pieceEdit) (db.TodoEdit, error) {
 	if p.empty() {
-		return out, nil
+		return db.TodoEdit{}, nil
+	}
+	out, err := s.checkPiecesNow(id, p)
+	if err != nil {
+		return out, &pieceError{err}
+	}
+	return out, nil
+}
+
+func (s *Service) checkPiecesNow(id string, p pieceEdit) (db.TodoEdit, error) {
+	var out db.TodoEdit
+	s.todos.mu.RLock()
+	defer s.todos.mu.RUnlock()
+	book := s.todos.todos
+	var cur Todo // its links now, as the book has them (a write may have changed them since the caller read it)
+	if t, ok := book[id]; ok && id != "" {
+		cur = *t
 	}
 	partOf := cur.PartOf
 	if p.PartOf != nil {
@@ -57,9 +80,6 @@ func (s *Service) checkPieces(id string, cur Todo, p pieceEdit) (db.TodoEdit, er
 		after, afterGiven = []string{}, true
 	}
 
-	s.todos.mu.RLock()
-	defer s.todos.mu.RUnlock()
-	book := s.todos.todos
 	if p.PartOf != nil && partOf != "" {
 		root, ok := book[partOf]
 		switch {
@@ -184,6 +204,13 @@ func (t PlanTask) pieceEdit() pieceEdit {
 	return p
 }
 
+// recheckPieces is checkPieces again for edit e of to-do id (id "" for a new to-do) as it is written, with
+// todoBook.writing held: every earlier link write is in the book by now, and no other can land before this one. It
+// returns the links to write, which may differ from e's (part_of changed since: after is emptied with it).
+func (s *Service) recheckPieces(id string, e db.TodoEdit) (db.TodoEdit, error) {
+	return s.checkPieces(id, pieceEdit{PartOf: e.PartOf, After: e.After})
+}
+
 // planPieces checks task t's links when its plan is made, against the to-do it will run on (todo_id) or, for a new
 // one, as a to-do nothing names yet, and keeps them cleaned.
 func (s *Service) planPieces(t *PlanTask) error {
@@ -192,8 +219,7 @@ func (s *Service) planPieces(t *PlanTask) error {
 		t.PartOf, t.After = "", nil
 		return nil
 	}
-	cur, _ := s.todoNow(t.ReuseTodo)
-	links, err := s.checkPieces(t.ReuseTodo, cur, p)
+	links, err := s.checkPieces(t.ReuseTodo, p)
 	if err != nil {
 		return err
 	}
@@ -206,21 +232,22 @@ func (s *Service) planPieces(t *PlanTask) error {
 	return nil
 }
 
-// startPieces writes task t's links on its to-do as it starts. Checked again: the request may have changed since the
-// plan was made; a link that no longer holds is left out (and logged) rather than failing a start the owner approved.
+// startPieces writes task t's links on its to-do as it starts. Checked again (and once more by editTodo as it writes):
+// the request may have changed since the plan was made; a link that no longer holds is left out (and logged) rather
+// than failing a start the owner approved.
 func (s *Service) startPieces(ctx context.Context, t PlanTask, todo Todo) Todo {
 	p := t.pieceEdit()
 	if p.empty() {
 		return todo
 	}
-	links, err := s.checkPieces(todo.ID, todo, p)
+	links, err := s.checkPieces(todo.ID, p)
 	if err != nil {
 		s.logf("task %s: part_of/after left out: %v", todo.ID, err)
 		return todo
 	}
 	out, err := s.editTodo(ctx, todo.ID, links)
 	if err != nil {
-		s.logf("task %s: part_of/after: %v", todo.ID, err)
+		s.logf("task %s: part_of/after: %v", todo.ID, err) // a *pieceError when a write since changed the request
 		return todo
 	}
 	return out
