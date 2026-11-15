@@ -166,6 +166,23 @@ describe("a request of one piece, and nothing queued", () => {
     expect(other.querySelectorAll("[data-edge]").length).toBe(1);
   });
 
+  it("keeps the root's card, to open the request's to-do, when its one piece of the same name is done and it is not", () => {
+    const opened: string[] = [];
+    act(() => root.render(
+      <TodoRequestGraph todos={[todo("req", { title: "Search page" }), todo("piece", { title: "Search page", part_of: "req", done_at: at(10) })]}
+        lookup={makeSessionLookup([])} machines={machines} onOpenTodo={(id) => opened.push(id)} />,
+    ));
+    const block = host.querySelector('[data-request="todo:req"]')!;
+    expect(block).not.toBeNull(); // still among the open requests
+    const rootCard = block.querySelector<HTMLButtonElement>("[data-root]")!;
+    expect(rootCard).not.toBeNull();
+    expect(block.querySelector("[data-node-request]")).toBeNull();
+    expect(block.querySelector('[data-node="todo:piece"]')).not.toBeNull();
+    expect(block.querySelectorAll("[data-edge]").length).toBe(1);
+    act(() => rootCard.click());
+    expect(opened).toEqual(["req"]);
+  });
+
   it("draws no queued strip when nothing is queued", () => {
     render([todo("w", { title: "Busy", agents: [link("s1")] })], [session("s1")]);
     expect(host.querySelector("[data-queued]")).toBeNull();

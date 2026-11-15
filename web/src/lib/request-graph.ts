@@ -104,7 +104,8 @@ export interface GraphRequest {
   touched: number;
   /** When its last piece closed (ms), for a done request. */
   finished: number;
-  /** One piece whose title is the request's words: drawn as that piece's card alone (with when it was said). */
+  /** One piece whose title is the request's words, done exactly when the request's own to-do is: drawn as that piece's
+   * card alone (with when it was said). */
   merged: boolean;
 }
 
@@ -370,7 +371,9 @@ function finish(req: Omit<GraphRequest, "edges" | "layers" | "rows" | "done" | "
   const done = req.nodes.length > 0 && req.nodes.every((n) => n.state === "done") && (!req.root || isDoneTodo(req.root));
   const touched = Math.max(0, ms(req.plan?.created_at) ?? 0, ...todos.map((t) => ms(t.updated_at) ?? ms(t.created_at) ?? 0));
   const finished = Math.max(0, ...todos.map((t) => ms(t.done_at) ?? 0));
-  const merged = req.nodes.length === 1 && sameWords(req.words, req.nodes[0].title);
+  // merged only while the root and its piece agree on done: the merged card stands for both and opens the piece, so a
+  // root still open behind a done piece (or done before it) keeps its own card, to be opened, completed or reopened
+  const merged = req.nodes.length === 1 && sameWords(req.words, req.nodes[0].title) && (!req.root || isDoneTodo(req.root) === (req.nodes[0].state === "done"));
   return { ...req, edges: merged ? [] : edges, layers, rows, done, touched, finished, merged };
 }
 

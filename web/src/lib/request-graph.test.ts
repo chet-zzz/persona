@@ -156,6 +156,28 @@ describe("a request of one piece that says the same", () => {
     expect([lay.edges, lay.nodes.get("todo:same")!.x, lay.width]).toEqual([[], lay.root.x, lay.root.x * 2 + CARD_W]);
     expect(layoutRequest(by("todo:other")).nodes.get("todo:other")!.x).toBeGreaterThan(CARD_W);
   });
+
+  it("keeps the root's card when the root and its piece disagree on done", () => {
+    const g = graph([
+      todo("open", { title: "Search" }),
+      todo("finished", { title: "Search", part_of: "open", done_at: at(5) }),
+      todo("closed", { title: "Export", done_at: at(5) }),
+      todo("going", { title: "Export", part_of: "closed" }),
+      todo("both", { title: "Import", done_at: at(6) }),
+      todo("both-piece", { title: "Import", part_of: "both", done_at: at(5) }),
+    ]);
+    const find = (k: string) => [...g.active, ...g.done].find((r) => r.key === k)!;
+    // the piece is done, the request's to-do still open: the request stays open, its root card drawn
+    const open = find("todo:open");
+    expect([g.active.includes(open), open.done, open.merged, node(open, "finished").state]).toEqual([true, false, false, "done"]);
+    expect(open.edges.map((e) => `${e.from}>${e.to}`)).toEqual(["root>todo:finished"]);
+    const lay = layoutRequest(open);
+    expect(lay.nodes.get("todo:finished")!.x).toBeGreaterThan(lay.root.x + CARD_W);
+    // and the other way round: the root done, its piece not
+    expect([find("todo:closed").done, find("todo:closed").merged]).toEqual([false, false]);
+    // both done: one card again
+    expect([find("todo:both").done, find("todo:both").merged]).toEqual([true, true]);
+  });
 });
 
 describe("a piece of a piece", () => {
