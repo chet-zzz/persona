@@ -14549,6 +14549,10 @@ if os.environ.get("MOCK_MODEL_PANEL_USAGE"):
     # A critical weekly bar beside cc_main's / cc_team's ordinary ones (#5056); all values are synthetic.
     LAUNCHER_QUOTAS["claude"] = {"gateway": "example-subscription", "pools": [
         {"name": "示例订阅", "state": "available", "windows": [_w("每周", 0.95, resets=later(hours=36))]}]}
+    # a provider whose long name wraps to two lines in the rail (anthropic_main, with MOCK_PROVIDERS) gets a half-used
+    # weekly bar too, to check a two-line caption and the bar don't touch
+    LAUNCHER_QUOTAS["anthropic_main"] = {"gateway": "example-subscription", "pools": [
+        {"name": "示例订阅", "state": "available", "windows": [_w("每周", 0.5, resets=later(hours=36))]}]}
 # "Add provider" › "Add from plugin" (docs/extensions/extensions.md "Model providers"): the providers made-up plugins offer (GET /api/v1/launchers/presets).
 LAUNCHER_PRESETS = [
     {"id": "example-gateway/team", "plugin": "example-gateway", "name": "示例网关 · 团队", "description": "团队共用的 Claude Code 网关，按 Key 计费",
