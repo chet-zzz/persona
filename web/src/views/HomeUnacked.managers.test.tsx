@@ -31,6 +31,9 @@ const decision = (id: string, todoId: string): TodoDecision =>
 // what each manager answers GET /todos/decisions/unacked with (the default's when the request names none)
 const answers: Record<string, TodoDecision[]> = { assistant: [decision("d_default", "t_default")], "m-1": [decision("d_m1", "t_m1")] };
 let asked: { url: string; manager: string | null }[] = [];
+// the hub sends a request that names no manager to its default; a manager listed here is from before the route
+let hubDefault = "assistant";
+let withoutRoute = new Set<string>();
 
 let host: HTMLDivElement;
 let root: Root;
@@ -44,12 +47,17 @@ beforeEach(() => {
   setRosterDefault("assistant");
   setToken("synthetic");
   asked = [];
+  hubDefault = "assistant";
+  withoutRoute = new Set();
   hub.todos = [todo("t_default", "assistant"), todo("t_m1", "m-1")];
   vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
     const manager = new Headers(init?.headers).get(MANAGER_HEADER);
     // only this group's request is counted (picking an assistant reads its profile too)
     if (String(url).endsWith("/todos/decisions/unacked")) asked.push({ url: String(url), manager });
-    return new Response(JSON.stringify({ decisions: answers[manager ?? "assistant"] ?? [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const answering = manager ?? hubDefault;
+    // a manager before the route: the mux's plain-text 404
+    if (String(url).endsWith("/todos/decisions/unacked") && withoutRoute.has(answering)) return new Response("404 page not found\n", { status: 404, headers: { "Content-Type": "text/plain" } });
+    return new Response(JSON.stringify({ decisions: answers[answering] ?? [] }), { status: 200, headers: { "Content-Type": "application/json" } });
   }));
   host = document.createElement("div");
   document.body.append(host);
@@ -85,5 +93,36 @@ describe("the unacknowledged decisions of the picked assistant", () => {
     await settle();
     expect(asked.map((a) => a.manager)).toEqual(["m-1", null]);
     expect(shown()).toEqual(["d_default"]);
+  });
+  // #8557 review: no pick, and the roster's default moves from a manager before the route to one with it. The old
+  // default's 404 marks only its own feed unsupported: the new default is another manager, asked afresh.
+  it("asks the new default afresh after the old default had no route", async () => {
+    withoutRoute = new Set(["assistant"]);
+    act(() => root.render(<HomeUnacked />));
+    await settle();
+    await settle();
+    expect(asked.map((a) => a.manager)).toEqual([null]);
+    expect(host.innerHTML).toBe("");
+
+    hubDefault = "m-1";
+    act(() => setRosterDefault("m-1"));
+    await settle();
+    await settle();
+    // no pick, so still no header: the hub's new default answers
+    expect(asked.map((a) => a.manager)).toEqual([null, null]);
+    expect(shown()).toEqual(["d_m1"]);
+  });
+
+  it("keeps a manager without the route quiet while the default stays", async () => {
+    withoutRoute = new Set(["assistant"]);
+    act(() => root.render(<HomeUnacked />));
+    await settle();
+    await settle();
+    act(() => setRosterDefault("assistant"));
+    hub.todos = [todo("t_default", "assistant"), { ...todo("t_m1", "m-1"), updated_at: at(9) }];
+    act(() => root.render(<HomeUnacked />));
+    await act(async () => { await new Promise((r) => setTimeout(r, 450)); });
+    expect(asked.length).toBe(1);
+    expect(host.innerHTML).toBe("");
   });
 });

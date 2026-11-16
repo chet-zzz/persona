@@ -10,7 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { formatDate, t } from "../i18n";
 import { errorText } from "../lib/api";
 import { useScopedTodos } from "../lib/current-assistant";
-import { useChosenManager } from "../lib/manager-choice";
+import { useChosenManager, useKnownDefault } from "../lib/manager-choice";
 import { href, onLinkClick, type Route } from "../lib/router";
 import { addTodoDecision, type Todo, type TodoDecision } from "../lib/todos";
 import { ackBody, groupByTodo, listsUnacked, overruleBody, UNACKED_FIRST, UnackedFeed, type UnackedState } from "../lib/unacked-decisions";
@@ -28,14 +28,21 @@ interface UnackedGroup {
 /** The groups to show, the to-do with the latest call first, and the feed to read again after a write. */
 function useUnacked(): { feed: UnackedFeed | null; groups: UnackedGroup[] } {
   const todos = useScopedTodos();
-  // the list is the current assistant's (its request names it, lib/manager-choice.ts): another one picked is another
-  // list, read afresh, and whether its manager has the route is asked again
-  const manager = useChosenManager();
+  // the list is the current assistant's manager's (its request names a pick, lib/manager-choice.ts; without one the hub
+  // sends it to the roster's default): the pick, else that default once known. Another manager is another list, read
+  // afresh, and whether it has the route is asked again; nothing is read by the placeholder default.
+  const chosen = useChosenManager();
+  const knownDefault = useKnownDefault();
+  const manager = chosen ?? knownDefault;
   const [state, setState] = useState<UnackedState>({ decisions: [], unsupported: false });
   const [feed, setFeed] = useState<UnackedFeed | null>(null);
   useEffect(() => {
-    const made = new UnackedFeed(setState);
     setState({ decisions: [], unsupported: false });
+    if (!manager) {
+      setFeed(null);
+      return;
+    }
+    const made = new UnackedFeed(setState);
     setFeed(made);
     made.refresh(true);
     return () => made.close();

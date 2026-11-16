@@ -10,6 +10,7 @@ vi.hoisted(() => {
   window.matchMedia ??= ((query: string) => ({ matches: false, media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as typeof window.matchMedia;
 });
 import { initI18n } from "../i18n";
+import { resetManagerChoice, settleRosterDefault } from "../lib/manager-choice";
 import type { Todo, TodoDecision } from "../lib/todos";
 
 const hub = vi.hoisted(() => ({ todos: [] as unknown[], unacked: [] as unknown[], reads: 0, missing: false, down: false, written: [] as [string, unknown][] }));
@@ -48,6 +49,9 @@ const later = async () => { await act(async () => { await new Promise((r) => set
 
 beforeAll(() => initI18n("en"));
 beforeEach(() => {
+  // the roster has been read: the list is the default manager's (HomeUnacked.managers.test.tsx covers the rest)
+  resetManagerChoice();
+  settleRosterDefault();
   hub.todos = [];
   hub.unacked = [];
   hub.reads = 0;
@@ -141,6 +145,20 @@ describe("the unacknowledged decisions group", () => {
     act(() => root.render(<HomeUnacked />));
     await later();
     expect(hub.reads).toBe(2);
+    expect(host.querySelectorAll("[data-decision]").length).toBe(1);
+  });
+
+  it("reads nothing until the roster's default is known, then reads once", async () => {
+    resetManagerChoice(); // the default is a placeholder again
+    hub.todos = [todo("t1")];
+    hub.unacked = [decision("d1", "agent")];
+    await mount();
+    expect(hub.reads).toBe(0);
+    expect(host.innerHTML).toBe("");
+    act(() => settleRosterDefault());
+    await settle();
+    await settle();
+    expect(hub.reads).toBe(1);
     expect(host.querySelectorAll("[data-decision]").length).toBe(1);
   });
 
