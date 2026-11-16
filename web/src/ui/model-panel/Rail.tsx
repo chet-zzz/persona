@@ -1,4 +1,4 @@
-// The model panel's rail (#5032, after Cindy's UnifiedModelRail): a 64 px column of view cells, Recent and Favorites (what
+// The model panel's rail (#5032, after Cindy's UnifiedModelRail): a 68 px column of view cells, Recent and Favorites (what
 // you keep), a short rule, then All and one cell per provider in the order given. Every cell has its mark and, under it, a
 // caption of up to two lines: a provider's caption is the part of its name that tells it from the others (`railCaptions`:
 // claude-aster, claude-max and codex read "aster", "max" and "codex"), because their letter marks are often the same and a
@@ -85,13 +85,13 @@ export function Rail({ providers, view, onView, disabled, quotas }: { providers:
         data-rail-cell={v.kind === "provider" ? v.provider : v.kind}
         onClick={() => onView(v)}
         className={cx(
-          "relative flex min-h-[46px] w-[54px] shrink-0 flex-col items-center justify-start gap-0.5 rounded-[9px] px-0.5 pt-1.5 pb-2 transition-colors duration-150",
+          "relative flex min-h-[46px] w-[60px] shrink-0 flex-col items-center justify-start gap-0.5 rounded-[9px] px-0.5 pt-1.5 pb-2 transition-colors duration-150",
           on ? "bg-ink text-surface" : "text-ink-3 enabled:hover:bg-hover-2 enabled:hover:text-ink-2",
           disabled && "cursor-not-allowed opacity-50",
         )}
       >
         <span className="flex h-4 items-center justify-center">{icon}</span>
-        <span data-rail-caption className="line-clamp-2 w-full text-center text-[10px] leading-[12px] break-words [overflow-wrap:anywhere]">{caption}</span>
+        <span data-rail-caption className="line-clamp-2 w-full text-center text-submeta leading-3.5 break-words [overflow-wrap:anywhere]">{caption}</span>
         {quota && (
           <span aria-hidden className="absolute bottom-[3px] h-[3px] w-[22px] overflow-hidden rounded-full" style={{ backgroundColor: "color-mix(in srgb, currentColor 18%, transparent)" }}>
             <span
@@ -127,7 +127,7 @@ export function Rail({ providers, view, onView, disabled, quotas }: { providers:
       onScroll={measure}
       data-rail-fade={[edges.up && "up", edges.down && "down"].filter(Boolean).join(" ") || undefined}
       style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
-      role="group" aria-label={t("ui-modelpanel.views")} className="flex min-h-0 w-16 shrink-0 scrollbar-none flex-col items-center gap-0.5 overflow-x-hidden overflow-y-auto border-r border-line px-1.5 py-2">
+      role="group" aria-label={t("ui-modelpanel.views")} className="flex min-h-0 w-[68px] shrink-0 scrollbar-none flex-col items-center gap-0.5 overflow-x-hidden overflow-y-auto border-r border-line px-1.5 py-2">
       {cell({ kind: "recent" }, t("ui-modelpanel.recent"), <Icon name="history" size={16} />)}
       {cell({ kind: "favorites" }, t("ui-modelpanel.favorites"), <Icon name="star" size={16} className={view.kind === "favorites" ? "fill-current" : undefined} />)}
       <div aria-hidden className="my-[3px] w-[22px] shrink-0 border-t border-line" />
