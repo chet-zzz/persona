@@ -141,6 +141,20 @@ func TestTodoPiecesConcurrentWrites(t *testing.T) {
 			noCycle(t, s, a.ID, b.ID)
 		})
 
+		// Same request only, from both ends: a sibling starting to wait for X and X moved to another request, at once.
+		t.Run("a sibling's after and a move", func(t *testing.T) {
+			other := send("POST", "/api/v1/todos", `{"title":"Sell the car"}`)
+			x, y := piece("Book the van"), piece("Pack the kitchen")
+			oneEach(t, "todo_update/PATCH",
+				func() bool {
+					_, err := runJSON(t, s, "conv1", "todo_update", map[string]any{"id": y.ID, "after": []string{x.ID}})
+					return err == nil
+				},
+				func() bool { return patch(x.ID, `{"part_of":"`+other.ID+`"}`)() == http.StatusOK },
+			)
+			afterInOwnRequest(t, s)
+		})
+
 		// One level only: a new piece of X and X made a piece of another request, at once.
 		t.Run("todo_create and a PATCH", func(t *testing.T) {
 			x := send("POST", "/api/v1/todos", `{"title":"Sell the car"}`)

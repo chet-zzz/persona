@@ -19,7 +19,10 @@ import (
 // The links are the manager's, checked whenever they are written (todo_create, todo_update, task_plan, the apps'
 // PATCH): the to-dos named exist, a to-do names neither itself nor a to-do that is itself a piece (one level: a request's
 // root is no piece, and a piece has no pieces), `after` names pieces of the same request only, and no `after` closes a
-// cycle. Neither is a foreign key: a deleted to-do leaves an id behind, which the readers skip and the next write of
+// cycle. The same-request rule holds from both ends: a piece another piece waits for keeps its part_of (moving it to
+// another request or clearing it is refused, naming who waits) until that wait is taken out of their after. Refused
+// rather than taken out for them: dropping the wait would let them start early without anyone deciding so, and the
+// write stays one row. Neither is a foreign key: a deleted to-do leaves an id behind, which the readers skip and the next write of
 // that list drops.
 //
 // Each writer checks a change first, to answer with what is wrong before asking or writing anything, and the write
@@ -98,6 +101,15 @@ func (s *Service) checkPiecesNow(id string, p pieceEdit) (db.TodoEdit, error) {
 			}
 		}
 	}
+	if id != "" && partOf != cur.PartOf {
+		if waiting := waitingFor(book, id, partOf); len(waiting) == 1 {
+			return out, fmt.Errorf("part_of: %q waits for this to-do (its after names it), so this to-do can't leave the request; "+
+				"first take it out of %q's after, then change part_of", waiting[0], waiting[0])
+		} else if len(waiting) > 1 {
+			return out, fmt.Errorf("part_of: %s wait for this to-do (their after names it), so this to-do can't leave the request; "+
+				"first take it out of their after, then change part_of", quotedIDs(waiting))
+		}
+	}
 	if afterGiven && len(after) > 0 {
 		if partOf == "" {
 			return out, errors.New("after names pieces of the same request: give part_of too")
@@ -150,6 +162,29 @@ func afterCycle(book map[string]*Todo, id string, after []string) string {
 		}
 	}
 	return ""
+}
+
+// waitingFor is the to-dos whose after names id and that would no longer be its siblings were id a piece of partOf
+// ("" no piece), sorted: id changing its request leaves them waiting for a piece of another one (or of none), which
+// after never names. Called with the book read-locked.
+func waitingFor(book map[string]*Todo, id, partOf string) []string {
+	var out []string
+	for _, t := range book {
+		if t.ID != id && slices.Contains(t.After, id) && (partOf == "" || t.PartOf != partOf) {
+			out = append(out, t.ID)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// quotedIDs is ids as an error names them: "a", "b".
+func quotedIDs(ids []string) string {
+	q := make([]string, len(ids))
+	for i, id := range ids {
+		q[i] = fmt.Sprintf("%q", id)
+	}
+	return strings.Join(q, ", ")
 }
 
 // cleanIDs is ids trimmed, without empty ones or repeats, in their order; never nil.
