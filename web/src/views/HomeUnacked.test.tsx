@@ -12,7 +12,7 @@ vi.hoisted(() => {
 import { initI18n } from "../i18n";
 import type { Todo, TodoDecision } from "../lib/todos";
 
-const hub = vi.hoisted(() => ({ todos: [] as unknown[], unacked: [] as unknown[], reads: 0, missing: false, written: [] as [string, unknown][] }));
+const hub = vi.hoisted(() => ({ todos: [] as unknown[], unacked: [] as unknown[], reads: 0, missing: false, down: false, written: [] as [string, unknown][] }));
 vi.mock("../lib/current-assistant", async (orig) => ({ ...(await orig<typeof import("../lib/current-assistant")>()), useScopedTodos: () => hub.todos }));
 vi.mock("../lib/api", async (orig) => {
   const real = await orig<typeof import("../lib/api")>();
@@ -23,6 +23,8 @@ vi.mock("../lib/api", async (orig) => {
       hub.reads++;
       // a manager before the route: the mux's plain-text 404
       if (hub.missing) throw new real.ApiError(404, "404 page not found", {}, false);
+      // a manager with the route but no decisions store (no database): 503, a failure that may pass
+      if (hub.down) throw new real.ApiError(503, "decisions need the database", {}, true);
       return { decisions: hub.unacked };
     },
   };
@@ -50,6 +52,7 @@ beforeEach(() => {
   hub.unacked = [];
   hub.reads = 0;
   hub.missing = false;
+  hub.down = false;
   hub.written = [];
   host = document.createElement("div");
   document.body.append(host);
@@ -150,6 +153,22 @@ describe("the unacknowledged decisions group", () => {
     await later();
     expect(hub.reads).toBe(1);
     expect(host.innerHTML).toBe("");
+  });
+
+  it("shows nothing while the manager cannot answer (503), and asks again when an open to-do changes", async () => {
+    hub.down = true;
+    hub.todos = [todo("t1")];
+    await mount();
+    expect(hub.reads).toBe(1);
+    expect(host.innerHTML).toBe("");
+    // unlike the route's 404, a failed read is not the manager's last word
+    hub.down = false;
+    hub.unacked = [decision("d1", "agent")];
+    hub.todos = [todo("t1", { updated_at: at(5) })];
+    act(() => root.render(<HomeUnacked />));
+    await later();
+    expect(hub.reads).toBe(2);
+    expect(host.querySelectorAll("[data-decision]").length).toBe(1);
   });
 });
 
