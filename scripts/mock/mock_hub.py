@@ -11217,6 +11217,7 @@ def _claude_dirs_state(mid):
 KEYS = []  # bodies of …/keys (the terminal's key bar and text field; GET /mock/keys)
 REWINDS = []  # bodies of …/rewind (#2436; GET /mock/rewinds)
 QUEUE_EDITS = []  # bodies of …/queue with the queue they pulled back (GET /mock/queue)
+SEND_NOWS = []  # "machine/session" of every …/queue/send-now, refused ones too (GET /mock/send_nows; #7169: one tap, one)
 UPLOADS = []  # files received (GET /mock/uploads)
 SENT = []  # bodies of sends, one per client_msg_id (GET /mock/sent)
 SENT_TO = []  # where each of them went: machine_id, session_id, client_msg_id, text (GET /mock/sent_to)
@@ -23105,6 +23106,9 @@ PLUGINS = {
                         "source": "installed", "enabled": True, "error": "这个扩展要 hub 的构建号 >=202612010000，这台是 202611041200",
                         "contributes": {"connectors": ["exampleweather"]}, "form": {"fields": []}, "config": {}, "secrets": [], "permissions": [_RUNS]},
 }
+import volc_mock  # noqa: E402  MOCK_VOLC: the built-in Volcengine speech extension (docs/extensions/volcengine-speech.md)
+if volc_mock.ENABLED:
+    PLUGINS[volc_mock.EXT] = volc_mock.plugin(_RUNS)
 PLUGINS["example-gateway"] = {
     "id": "example-gateway", "name": "Example 网关面板", "kind": "ui", "status": "running", "version": "1.0.0", "source": "installed",
     "enabled": True, "description": "在启动器页上显示 Example 网关的余额、Key 和用量。", "contributes": {"ui": ["home", "panel", "usage", "today", "gpu", "notes"]},
@@ -24132,6 +24136,8 @@ def markets_route(handler, p, body):
                 ui = [{"plugin": "example-gateway", "id": "panel", "title": "Example 网关", "placement": "launcher_section"},
                       {"plugin": "example-gateway", "id": "elsewhere", "title": "别家网关", "placement": "launcher_section"}]
         ui += [u for u in INBOX_ITEM_UI if placement in ("", u["placement"])]
+        if volc_mock.ENABLED and PLUGINS.get(volc_mock.EXT, {}).get("enabled") and placement in ("", "plugin_page", "extension_page"):
+            ui += PLUGINS[volc_mock.EXT]["ui"]
         if os.environ.get("MOCK_EXTENSION_SHOWCASE") == "1" and placement in ("", "nav_page"):
             from pathlib import Path
             snapshots = Path(__file__).resolve().parents[2] / "schema/extension/examples/showcase"
@@ -24142,6 +24148,9 @@ def markets_route(handler, p, body):
     if len(parts) == 8 and parts[4] == "example-chat" and parts[5:7] == ["-", "ui"] and method == "POST" and INBOX_ITEM_UI:
         code, out = inbox_item_ui(parts[7], req)
         handler.send_json(out, code); return True
+    if volc_mock.ENABLED and len(parts) == 8 and parts[3] == "plugins" and parts[4] == volc_mock.EXT and parts[5:7] == ["-", "ui"] \
+            and method == "POST" and PLUGINS.get(volc_mock.EXT, {}).get("enabled"):
+        handler.send_json(volc_mock.page_post(PLUGINS[volc_mock.EXT], req)); return True
     if len(parts) == 8 and parts[3] == "plugins" and parts[5] == "-" and parts[6] == "ui" and method == "POST":
         if parts[4] != "example-gateway" or "example-gateway" not in PLUGINS:
             handler.send_json({"error": "no such plugin", "code": "not_found"}, 404); return True
@@ -24505,6 +24514,8 @@ def features():
 
 
 def _plugin_needs(pl):
+    if volc_mock.ENABLED and pl["id"] == volc_mock.EXT:
+        return volc_mock.view(pl, ASSISTANT_CONFIG)
     missing = ["密钥「%s」" % s["title"] for s in pl.get("secrets", []) if s.get("required") and not s.get("set")]
     if pl["enabled"] and pl["status"] in ("needs_setup", "running") and pl["source"] == "installed":
         pl["status"] = "needs_setup" if missing else "running"
@@ -24584,6 +24595,13 @@ def plugins_route(handler, p, body):
         elif pl["id"] in _EXTENSION_PACK_OFF:
             _EXTENSION_PACK_OFF.remove(pl["id"])
         _auto_upgrade_paused(pl)
+    elif volc_mock.ENABLED and pl["id"] == volc_mock.EXT and rest == ["config"] and method == "PUT":
+        volc_mock.config_put(pl, req.get("config") or {}, ASSISTANT_CONFIG)
+    elif volc_mock.ENABLED and pl["id"] == volc_mock.EXT and rest == ["secrets", "key"] and method == "PUT" and not req.get("reference"):
+        why = volc_mock.secret_put(pl, req.get("value") or "")
+        if why:
+            handler.send_json({"error": why, "code": "check_failed"}, 400)
+            return True
     elif rest == ["config"] and method == "PUT":
         cfg = req.get("config") or {}
         if pl["id"] == "example-gateway-quota":
@@ -25077,6 +25095,17 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         LOG.write("%s %s\n" % (self.command, self.path)); LOG.flush()
 
+    def send_share_page(self):
+        """GET /mock/share-page: a plain page with a title, for Share › Persona from Safari (#2282, ShareFromAppsTests)."""
+        page = (b'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+                b'<title>A Page Worth Reading</title></head><body><h1>A Page Worth Reading</h1>'
+                b'<p>Made-up text for sharing from Safari.</p></body></html>')
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
     def send_json(self, obj, status=200, headers=None, add_error_code=True):
         global LOST_RECEIPT
         if self.command == "GET" and 200 <= status < 300:
@@ -25477,6 +25506,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/mock/renew": return self.send_json(*renew_requests(int(q.get("minutes", ["30"])[0] or 30)))
         if p == "/api/v1/auth/tokens": return self.send_json({"tokens": TOKENS, "current": "dev_phone", "push": TOKEN_PUSH})
         if p == "/mock/sent": return self.send_json({"sent": SENT})
+        if p == "/mock/share-page": return self.send_share_page()
         if p == "/mock/sent_to": return self.send_json({"sent": SENT_TO})
         if p == "/mock/lark_reads": return self.send_json({"reads": LARK_READS})
         if p == "/mock/mail_sent": return self.send_json({"sent": MAIL_SENT})
@@ -25601,6 +25631,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/mock/rewinds": return self.send_json({"rewinds": REWINDS})
         if p == "/mock/queue": return self.send_json(queue_messages(q.get("text", [None])[0], "clear" in q, int(q.get("photos", ["0"])[0] or 0)))
         if p == "/mock/queue_edits": return self.send_json({"edits": QUEUE_EDITS})
+        if p == "/mock/send_nows": return self.send_json({"send_nows": SEND_NOWS})
         if p == "/mock/terminal_input": return self.send_json({"input": TERMINAL_INPUT})
         if p == "/mock/terminal_node":
             state, mid = q.get("state", [""])[0], q.get("machine", [TERMINAL_NODE["machine"]])[0]
@@ -27940,6 +27971,7 @@ class H(BaseHTTPRequestHandler):
                     return self.send_json({"ok": True})
             return self.send_json({"error": "session not found"}, 404)
         if p.startswith("/api/v1/sessions/") and p.endswith("/queue/send-now"):  # node session.queue.send_now (#6088)
+            SEND_NOWS.append(p.split("/")[4] + "/" + p.split("/")[5])
             s = next((x for x in SESSIONS + ASSISTANT if x["session_id"] == p.split("/")[5]), None)
             if not (s or {}).get("queued"):
                 return self.send_json({"code": "nothing_queued", "error": "Nothing is queued for the agent any more."}, 409)
