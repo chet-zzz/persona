@@ -175,6 +175,9 @@ nonisolated enum Theme {
     static let loop = Color(light: 0x2E6FD0, dark: 0x5B9BFF)
     /// Count badges on rows (unread messages): white text on it is ≥ 4.5:1 in both appearances.
     static let countBadge = Color(light: 0x636366, dark: 0x636366)
+    /// The count on a tab bar's item, as the system's tab bar draws `.badge` (white on its red), the iPad's included: iPhone
+    /// Duo's tab bar (#4231).
+    static let tabBarBadge = Color.red
     static let onSolid = Color.white
 
     /// A code to scan with another app (a QR code): dark modules on a light ground in both appearances, the way
@@ -225,7 +228,7 @@ nonisolated enum Theme {
     enum Radius {
         /// A file's thumbnail in a list row, about an icon's size (the Files tab): a page's corner, not a tile's.
         static let thumbnail: CGFloat = 3
-        /// Badges, inline code, small marks.
+        /// Badges, small marks.
         static let badge: CGFloat = 6
         /// Code blocks, thumbnails, segmented controls, small tiles.
         static let control: CGFloat = 10
@@ -709,6 +712,32 @@ nonisolated enum Theme {
         static let lineStrong = Color.primary.opacity(0.18)
     }
 
+    /// A heat grid (`HeatGrid`, docs/design/DESIGN_SYSTEM.md 3.15): the token calendar's squares, a day each (a column a
+    /// week) or an hour each (a row a day), in the theme color's steps from faint to full and no usage in the neutral
+    /// fill. The squares keep their size at every text size; a wider screen shows more weeks.
+    enum Heat {
+        /// A day's square and the room between two: 19 weeks across an iPhone's card.
+        static let cell: CGFloat = 13
+        static let gap: CGFloat = 3
+        static let radius: CGFloat = 3
+        /// An hour's square on the last week's grid: as wide as 24 fit, this high, this far apart.
+        static let hourHeight: CGFloat = 15
+        static let hourGap: CGFloat = 2
+        /// The fewest and the most weeks a calendar shows.
+        static let minWeeks = 8
+        static let maxWeeks = 53
+        /// The theme color's strength at each step above none (`HeatLevels`, four steps).
+        static let steps: [Double] = [0.28, 0.5, 0.75, 1]
+        /// Today's outline and the picked square's.
+        static let todayLine: CGFloat = 1.5
+        static let pickedLine: CGFloat = 2
+
+        /// A square at step `level`: 0 is no usage, 1 to 4 the theme color's steps.
+        static func fill(_ level: Int) -> Color {
+            level <= 0 ? Theme.Fill.chip : Theme.accent.opacity(steps[min(level, steps.count) - 1])
+        }
+    }
+
     /// Motion: a state change snaps, a layout change glides. Nothing repeats except the Needs You dot, the work spinner,
     /// the persona's dot in the Persona tab's top bar (docs/apple/persona.md), the dot of a held mic (`DictationHold`) and,
     /// when it is turned on, the composer's glow while a reply is generating (`ComposerGlow`); those stop with Reduce Motion
@@ -1044,9 +1073,24 @@ nonisolated enum Theme {
         static let agentsRoom: CGFloat = 34
         /// The optional third segment must leave both side buttons reachable on narrow screens.
         static let compactSwitchLargestTypeSize: DynamicTypeSize = .large
-        /// A segment of the switch on iPhone Duo's side rail (`ShellSideRail`): square, a symbol over the page's name, within
-        /// the column the system's bars take beside the content.
-        static let railSegment: CGFloat = 54
+        /// The switch as iPhone Duo's tab bar (#4231: `ShellSwitch(axis: .vertical)` in the side column of the outer display
+        /// and of the inner one on its side, `ShellSwitch(bottomBar: true)` along the inner one's foot upright): a bar of fixed
+        /// items, as the system's tab bar it stands for, so its items keep the default text size (DESIGN_SYSTEM.md 6.2), each
+        /// also shown large on a long press (the Large Content Viewer).
+        static let switchTypeSize: DynamicTypeSize = .large
+        /// A tab bar item there: the page's symbol in a `Size.well` circle over its name, a tap target wide and tall and
+        /// more, so the names fit in every language (「メッセージ」 at the least scale).
+        static let tabBarItemWidth: CGFloat = 56
+        static let tabBarItemHeight: CGFloat = 56
+        /// iPhone Duo's side column, where the system puts its bars down the side (both displays: an 84 pt safe-area
+        /// inset): the strip at the screen's edge the system's bars keep clear of. The status bar is centred on the rest of
+        /// the column (its clock 49 pt from the edge on both displays), and so is the side tab bar.
+        static let sideColumnEdge: CGFloat = 14
+        /// Where the side tab bar's foot stands where nothing is under it in the column (the open Duo's tabs): this share of
+        /// the column's height (the safe area's) above its foot, so the bar is in the lower middle of the column, as a tab
+        /// bar down the side of the outer display stands (the owner's reference, #4231), not a small block at the foot. On
+        /// the outer display's rail the face and the page's action are under it.
+        static let sideTabBarFoot: CGFloat = 0.25
     }
 
     /// The page behind lists and chats.
@@ -1057,8 +1101,6 @@ nonisolated enum Theme {
 
     static let primaryText = Color(light: 0x1C1C1E, dark: 0xF2F2F7)
     static let codeBackground = Color(light: 0xF3F1EC, dark: 0x1C1D21)
-    /// Inline code in a reply (#2984): a light gray under the body's color (blue is for what opens).
-    static let inlineCodeBackground = Color(light: 0xEBEBEF, dark: 0x2C2C31)
     /// A reply's code block's title bar (#2984): its language and Copy, a shade off `codeBackground`.
     static let codeBar = Color(light: 0xE8E5DE, dark: 0x27282D)
     /// A reply's quote (#2984): its card under the accent bar, the accent faint.

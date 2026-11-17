@@ -5,7 +5,7 @@ import { BASE, stripBase } from "../lib/base";
 import { href } from "../lib/router";
 import { takeOverlayEntry } from "../lib/back-close";
 import { useScrollMemory } from "../lib/scroll-memory";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, enc, errorText } from "../lib/api";
 import { splitDevices } from "../lib/devices";
 import { ago } from "../lib/format";
@@ -20,7 +20,7 @@ import { Group, Row, Pill, RowConfirm, Switch } from "./settings/SettingsParts";
 import { LanguageRow } from "./settings/LanguageRow";
 import { RecentChatsRow, TextSizeRow, ThemeColorPicker } from "./settings/LookSettings";
 import { setReplyMotionEnabled, useReplyMotionSetting } from "../ui/stream/motion";
-import { setAgentDetails, setContextAsUsed, useAgentDetails, useContextAsUsed } from "../lib/context-usage";
+import { setAgentDetails, useAgentDetails } from "../lib/context-usage";
 import { setSidebarTerminals, useSidebarTerminals } from "../lib/sidebar-terminals";
 import { HubList } from "./Hubs";
 import { useDisconnect } from "./DisconnectBrowser";
@@ -31,13 +31,12 @@ import { useInboxSourcesShown } from "../lib/subscriptions";
 import { ModelConfiguration } from "./settings/ModelConfiguration";
 import { AgentSettings } from "./settings/AgentSettings";
 import { SidebarPagesGroup } from "./settings/SidebarPages";
+import { StartPageGroup } from "./settings/StartPage";
 import { AgentGroup } from "./settings/AgentGroup";
 import { AssistantSettings } from "./settings/AssistantSettings";
 import { PersonaPicker } from "./assistant/Persona";
-import { Connectors } from "./settings/Connectors";
 import { TriageSettings } from "./settings/TriageSettings";
 import { TranslationSettings } from "./settings/TranslationSettings";
-import { Extensions } from "./settings/Extensions";
 import { ShortcutSettings } from "./settings/ShortcutSettings";
 import { NotificationSettings } from "./settings/NotificationSettings";
 import { DesktopSettings } from "./settings/DesktopSettings";
@@ -67,6 +66,7 @@ import { searchSettings, type SearchGroup } from "./settings/search";
 import { GroupAction, GroupFooter, GroupTitle, hasFooter } from "./settings/SettingsGroups";
 import { SHEET_QUERY, useMedia } from "../ui/overlay";
 import { lazyDialog, lazyOverlay, useOpened } from "./LazyOverlay";
+import { lazyPage } from "../lib/lazy-page";
 import { formatList, t } from "../i18n";
 
 // ── types (docs/integrations/launchers.md) ───────────────────────────
@@ -138,6 +138,16 @@ export function tokens(n: number): string {
 }
 
 // ── page ────────────────────────────────────────────────
+
+// The Extensions and Connectors pages, with what only they draw (the market, an extension's own settings and sign-in, the
+// hub's connectors, the Lark bot, the sent-message rules), are about 44% of what the Settings chunk renders (#8897):
+// chunks of their own, loaded when one of them is opened, or ahead of it when the pointer or the focus reaches its row in
+// the sidebar (NavRow). Every other category draws with the Settings chunk as before.
+const Extensions = lazyPage(() => import("./settings/Extensions").then((m) => m.Extensions));
+const Connectors = lazyPage(() => import("./settings/Connectors").then((m) => m.Connectors));
+const TAB_PAGES: Partial<Record<Tab, { preload: () => Promise<unknown> }>> = { extensions: Extensions, connectors: Connectors };
+// a failed load is not kept (lazyPage): opening the page asks again, and PageBoundary shows the failure then
+const preloadTab = (k: Tab) => void TAB_PAGES[k]?.preload().catch(() => {});
 
 function readSettingsLocation() {
   const redirect = redirectLegacySettings(location.search, location.hash, stripBase(location.pathname));
@@ -363,22 +373,22 @@ export function Settings({ onToggleSidebar }: { onToggleSidebar: () => void }) {
               )) : (
                 <ChannelList onOpen={(id) => pick("channels", id)} onMarketItem={(market, id) => pick("extensions", routeSub({ kind: "item", market, id }))} />
               ))}
-              {tab === "connectors" && (sub && sub !== SENT_SUB && sub !== "feishu-bot" && twoCol ? (
+              {tab === "connectors" && <Suspense fallback={<Loading />}>{sub && sub !== SENT_SUB && sub !== "feishu-bot" && twoCol ? (
                 <div className="flex gap-6">
                   <div className="w-[300px] shrink-0"><Connectors open={null} openBeside={sub} onOpen={(id) => pick("connectors", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} /></div>
                   <div className="min-w-0 flex-1"><Connectors open={sub} onOpen={(id) => pick("connectors", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} /></div>
                 </div>
               ) : (
                 <Connectors open={sub} headerBack={phone} onOpen={(id) => pick("connectors", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} />
-              ))}
-              {tab === "extensions" && (extensionsRoute(sub).kind === "extension" && twoCol ? (
+              )}</Suspense>}
+              {tab === "extensions" && <Suspense fallback={<Loading />}>{extensionsRoute(sub).kind === "extension" && twoCol ? (
                 <div className="flex gap-6">
                   <div className="w-[300px] shrink-0"><Extensions open={null} openBeside={sub} onOpen={(id) => pick("extensions", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} onConnector={(id, manager) => pick("connectors", ownedSub(id, manager))} /></div>
                   <div className="min-w-0 flex-1"><Extensions open={sub} onOpen={(id) => pick("extensions", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} onConnector={(id, manager) => pick("connectors", ownedSub(id, manager))} /></div>
                 </div>
               ) : (
                 <Extensions open={sub} headerBack={phone} onOpen={(id) => pick("extensions", id)} onChannel={(id, manager) => pick("channels", ownedSub(id, manager))} onConnector={(id, manager) => pick("connectors", ownedSub(id, manager))} />
-              ))}
+              )}</Suspense>}
               {tab === "shortcuts" && <ShortcutSettings />}
               {tab === "devices" && <Devices />}
               {tab === "hub" && <>
@@ -543,6 +553,8 @@ function NavRow({ k, selected, contentId, onPick }: { k: Tab; selected: boolean;
     <button
       type="button"
       onClick={() => onPick(k)}
+      onPointerEnter={() => preloadTab(k)}
+      onFocus={() => preloadTab(k)}
       aria-current={selected ? "page" : undefined}
       aria-controls={contentId}
       className={cx(
@@ -634,6 +646,7 @@ function General({ onModel }: { onModel: () => void }) {
       </Group>
 
       <DesktopSettings />
+      <StartPageGroup />
       <SidebarPagesGroup />
 
       <section id="settings-translation" className="scroll-mt-4">
@@ -670,7 +683,6 @@ function AgentPreferences() {
   const workBrowserReady = useStore((s) => s.features.includes("sessions_dimensions"));
   const sidebarTerminals = useSidebarTerminals();
   const agentDetails = useAgentDetails();
-  const contextAsUsed = useContextAsUsed();
   return (
     <Group title={t("settings.agent_preferences")} anchor="agent-preferences">
       <AgentOpenRow />
@@ -680,9 +692,6 @@ function AgentPreferences() {
       </Row>}
       <Row label={t("context.details")} hint={t("context.details_hint")} wrapHint anchor="agent-details">
         <Switch on={agentDetails} onChange={setAgentDetails} label={t("context.details")} />
-      </Row>
-      <Row label={t("context.as_used")} hint={t("context.as_used_hint")} wrapHint anchor="context-as-used">
-        <Switch on={contextAsUsed} onChange={setContextAsUsed} label={t("context.as_used")} />
       </Row>
     </Group>
   );
