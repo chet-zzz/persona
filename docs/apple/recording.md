@@ -74,7 +74,7 @@ In-person meetings and hallway discussions went unrecorded: the recorder sat fou
 - **The calendar names it** (`MeetingCalendar`): the event on now (all-day, declined and untitled ones aside; one starting within 5 minutes counts; of overlapping ones, the one that started last) gives the title, and a copy of the event goes into `RecordingEntry.meeting` (`RecordingMeeting`: event id, title, start / end, location, attendees by name). It reads only with full access already granted, so a start never waits on a prompt; a meeting recording started in the app asks once, after the recording has begun, and renames it if an event turns up. Without an event the hub names it from what was said once enough is said, and until then the title is "Meeting · <date time>" ("Titles" below).
 - A watch recording made during a calendar event is that meeting's too: the phone tags it when its first segment or end arrives (`MeetingRecorder.tagWatchRecording`, by the watch's `createdAt`). The watch has no calendar.
 - Language: every start uses the one last picked on the Recordings page (`RecordingDefaults.localeKey`), Chinese until then. The on-device Chinese model writes the English words said among Chinese in Latin letters; there is no mixed-language model on device (the hub's realtime service is #2083).
-- **Live Activity** (`docs/apple/live-activity.md`, "Recording"): any recording on the phone, a meeting's or a note, shows its name, what it is, bookmarks and the time on the Lock Screen and in the Dynamic Island, with **Bookmark** and **Stop** (they work locked, as a voice memo's). Tapping it opens Recordings (`persona://record`).
+- **Live Activity** (`docs/apple/live-activity.md`, "Recording"): any recording on the phone, a meeting's or a note, shows its name, what it is, bookmarks and the time on the Lock Screen and in the Dynamic Island, with **Bookmark** and **Stop** (they work locked, as a voice memo's). A meeting's **End** instead opens the meeting and asks first (#8731 V4, `RecordingLink.end`). Tapping it opens Recordings (`persona://record`).
 - **A call**: the interruption pauses the recording and closes the open segment at once (`RecordingSegmentWriter.cut`), so an app stopped during a long call keeps everything said before it. When the system ends the interruption the recording resumes by itself (whether or not it says `shouldResume`: the meeting goes on). If the microphone can't be opened again in the background, the phone posts "Recording Paused" (`MeetingRecorder.notifyPaused`), the activity says "Paused by a call · Open Persona to continue", and coming back to the app resumes it (`resumeAfterInterruption`, on `didBecomeActive`). A media services reset while paused stops the recording (its engine is gone) and keeps what was saved.
 - **Ended by iOS in the background** (#9108, #9129): a recording keeps the app running there, under iOS's CPU and memory limits, and an app killed for them leaves no crash log. The recording ends at its last finished segment (`RecordingLibrary.recover` writes the end at the next launch, and the upload then says `complete`), and since a killed app can't end its Live Activity, the activity goes stale a little after the app last confirmed it was recording and draws the recording stopped ([live-activity.md](live-activity.md) "Recording").
 - **Stopped in the background** (the activity's Stop with the phone locked): the audio session ends, and with it the app's right to run. `MeetingRecorder.finishInBackground` holds a background task for up to 30 s, until the last segment is transcribed and uploaded, so the minutes don't wait for the next launch.
@@ -96,7 +96,7 @@ Design and reasons: `docs/design/proposals/meeting-recording.md`. On iPhone a ru
 
 - Top to bottom: title (with the page menu, Meeting / Note, and Hide), Meeting chip and state line (dot, or a pause glyph, never color alone), the timer (`Text(timerInterval:)`, the system ticks it), a level meter (`RecordingLevelMeter`, 30 fps clock, one still frame with Reduce Motion or Low Power; the level is `RecordingCapture.inputLevel`, the writer's own smoothed level), the Persona strip when the hub offers attending (role menu, Who Attends…, problem text as a `NoticeBanner`), and one timeline (`RecordingTimeline`): transcript sentences, bookmarks and Persona exchanges in time order. Sentences arrive per finished segment (about every 30 s), so the audio newer than the last sentence shows as "Transcribing the last N s" and an empty timeline says "Listening…". The timeline follows the newest item unless the reader scrolled up; then **Jump to Latest** appears with the count of new items (`RecordingFollow`).
 - The bottom bar stays under the thumb: **Ask Persona** (prominent, only when Persona attends; keyboard button for a typed question, written in a row of the bar), then Pause / Continue, Stop and Bookmark. At accessibility sizes it stacks, holds Ask Persona and Stop, and a More menu has Pause, Bookmark and Type a Question.
-- **Stop asks first** ("Stop Recording?", the audio is saved on the device and its text goes to Knowledge, a stopped recording can't be continued). The Live Activity's, Control's and Siri's Stop stay one tap.
+- **Stop asks first** ("Stop Recording?", the audio is saved on the device and its text goes to Knowledge, a stopped recording can't be continued). The Control's and Siri's Stop stay one tap. The Live Activity's Stop is one tap for a recording, but a meeting's End opens the meeting and asks (#8731 V4).
 - **Wrap-up** (`RecordingWrapUp`): after Stop the same sheet cross-fades to the recording's steps, worked out from state the phone already has (`RecordingPhase`): Saved, Transcribed, Syncing to Knowledge (with "Waiting for the hub" when unpaired or offline), Writing minutes (meetings), Minutes ready. A failed step shows its reason and the existing action (Resume Transcribing, Retry for minutes). **Open Minutes** / **Open Recording** (the one solid button) pushes the recording's page inside the sheet, **Done** (top trailing, where Hide is while recording) closes it; everything goes on in the background.
 - DEBUG: `-showMeetingSample flow` (no microphone) records a made-up meeting by itself: the clock and level move, a line is heard every 6 s, Pause, Bookmark and Stop work through DEBUG sample paths in `RecordingCapture` (the entry ends, `onSaved` runs), so the wrap-up reaches the minutes against the mock hub (`POST /mock/recording_minutes {"mode":"ready"}` before the launch; the app asks again every 15 s). The existing values (`recording|paused|interrupted|listening|taking-part|answered|minutes|pending`) work as before, and their Stop now ends the sample too. UI test: `MeetingRecordingUITests.testLiveSheetFlowReachesTheMinutes`.
 - The recording's page (`RecordingDetailView`): title "Recording", a compact header (title, when and where on one line, attendees, one source line), the minutes straight after it, the transcript, then the actions and, last, the retention paragraph. "Writing the minutes…" is a row with a spinner; a failed write shows the reason and a **Retry** button (`minutes-retry`); the sections unfold with `Theme.Motion.reveal` (not with Reduce Motion); time chips have a 44 pt hit area; transcript rows are identified by where their sentence starts.
@@ -140,7 +140,7 @@ Persona can attend a meeting being recorded on the iPhone (#2981; the iPhone sid
 - **Asking, by a tap only** (no wake phrase; `MeetingAsk`): **Ask Persona** asks about what was just said: the open segment is cut at the tap (`RecordingCapture.flushSegment`), transcribed and its lines sent, then `POST …/ask` goes with `at` and `live_next`, and the question the hub heard replaces "What was just said". **Type** opens a question row in the live sheet's bottom bar, not a system alert (#4486, DESIGN_SYSTEM.md 4.4): the composer's field, which grows to a few lines, and its send button, which waits for words; Return sends too, and the keyboard button becomes Cancel. The timeline and the earlier answers stay in sight while typing. Each question has the phone's own id; a `202`, a timeout or a server error sends the same request again a few seconds later, for up to 4 minutes. A failure says what happened in plain words and offers Retry with the same id. An answer names the earlier meetings and projects it drew on (`sources`), a meeting with when it was in the minutes' date style (its `start` / `end`; `when` from a hub without them, #4875).
 - **Spoken answers** (`MeetingSpeaker`): an answer with `speak` (taking part) is said at most once, only for a question asked in this run, only while the recording runs and the role still speaks (checked again just before the first sound), and only when it came within a minute of the tap. It is said in a voice of the hub's when it offers one (`MeetingVoiceRoutes`, asked again after a minute). First a `speech` contribution that reads (#8712, [extensions.md](../extensions/extensions.md) "Speech"): the first running extension in the list that contributes one, while its `GET …/speech/<cid>/info` says protocol 1 and no `setup` (kept a minute); the phone sends the text and its `lang` to `POST …/speech/<cid>/speak`, read in the voice set in that extension's settings (the built-in Volcengine speech's). Else the realtime voice of voice chats (#5004): the voice extension runs, is set up and lists `speak` in `/info`; the phone sends the model of the use `plugin.<id>` and the voice picked on this device (`VoiceTimbre`) to `POST …/speak`. Either way it plays the PCM as it streams in (`MeetingVoicePlayer`, an engine of its own in the recording's session, holding the first 0.3 s). Without that voice, on an error (offline, `no_upstream`, `upstream_*`, an older hub's 404), with no audio at all, or when no audio has come within 8 seconds, the phone's on-device voice for its `lang` says it instead (`AVSpeechSynthesizer`, `MeetingDeviceVoice`). Either way it plays in the recording's own audio session, so the recording goes on. A realtime answer cut off midway plays what came and is not said again. Where it plays follows the voice call's route rule (`VoiceRoute.output`, #3015): a connected headset, else the loudspeaker, never the earpiece; the recording keeps its microphone. A recording that starts as Take Part lets a Bluetooth headset play (`allowBluetoothA2DP`, listening only; `RecordingCapture.playsAloud`), which an Off recording's session never does. **Stop Speaking** cuts it short.
 - **Its echo is not the meeting's** (#5905, [meeting-minutes.md](../assistant/meeting-minutes.md) "Persona's echo"): every stretch the phone speaks in is kept on the recording with the answer said in it (`RecordingAttendance.spoken`, `RecordingSpan.text`), from when its audio actually begins (the realtime voice may take a moment to start; what the room says meanwhile is the room's). A sentence is Persona's echo only when it overlaps a stretch (0.5 s more on each side, `MeetingEcho.margin`) and its words are the answer's (at least 60% of its character bigrams after normalizing, `MeetingEcho.containment`; `RecordingSpan.echoes`), so what anyone else says while Persona answers stays the meeting's. A stretch saved before has no text and keeps the old rule, at least half of the line inside it. Echo lines stay on the recording, marked: hidden wherever the transcript is shown (`RecordingEntry.sentences` is the lines that are not echo; the timeline and Talk skip them too), never in the live log, and uploaded with `echo: true` beside the stretches (`spoken`) to a hub that lists `meeting_echo`, read from its `hello` at each upload (`RecordingEntry.markedSentences`, `RecordingUpload`); to a hub without it they are left out of the upload. A line transcribed while the answer is still being said is checked against the stretch so far (`MeetingSpeaker.openSpan`, which carries the whole answer). Persona's answers stay on the hub as the meeting's `asks`, not transcript lines.
-- **The Live Activity**: under the name, "Persona listening" or "Persona taking part"; the latest answer, cut to two lines (the hub posts no notification for answers); **Ask Persona**, and **Turn Off Persona** (`TurnOffMeetingAttendanceIntent`) beside Bookmark and Stop, which give up their words for their marks so the four fit. Ask and Turn Off work from the Lock Screen without unlocking, as Stop does: the hub answers a meeting only from meeting material.
+- **The Live Activity**: under the name, "Persona listening" or "Persona taking part"; the latest answer, cut to two lines (the hub posts no notification for answers); **Ask Persona** between Bookmark and End, each with its words (#8731 V4: Turn Off Persona left the activity; Remove is in the meeting room). Ask works from the Lock Screen without unlocking: the hub answers a meeting only from meeting material.
 - In the attending session the meeting's batches show as messages from **Meeting** (`MessageSource` kind `meeting`).
 - Screenshots and UI tests: `-showMeetingSample listening|taking-part|answered` (a made-up meeting Persona listens to, takes part in, or takes part in with two answers, the newest being said); `-openMeetingSettings YES` for Settings › Meetings. The mock hub serves the whole contract (`scripts/mock/mock_hub.py`, "Attending a meeting"); `POST /mock/meeting_attendance {"on", "default"}` switches the feature and the default before a launch, and `GET /mock/meeting_attendance` reads back each recording's role, live log and questions (`MeetingAttendanceUITests`).
 
@@ -914,6 +914,84 @@ Settings › Meetings, the meeting page, the Live Activity, the recording's page
   and how far the hub is; with the highlights (`-showMeetingSample room-hub-highlights`, `room-hub` started with them
   too) the card holds no line and no Live box, Full Transcript shows the hub's lines, then on `{"upstream": "failed"}`
   the phone's own under the notice, and back on the page the notice under the card's title.
+
+## A meeting's tape and its replay
+
+For development and tests only (#9417): DEBUG builds, launch arguments, no UI and no setting. Tuning how the live
+transcript, the highlights and the map work together needs the same meeting played many times; a real meeting is slow to
+hold and never the same twice. So a meeting can be recorded from an audio file, everything the meeting room was shown is
+written down as it arrives (a *tape*), and a tape plays back in the room at its own pace.
+
+### An audio file in place of the microphone
+
+`-openMeetingAudio <file>` (an absolute path, or a name in the app's Documents folder): every recording started in that
+run (never an all-day one) hears the file instead of the microphone. `RecordingFileInput` reads it at real time, 100 ms a
+buffer, and `RecordingSegmentWriter` takes its buffers through `process` as the input tap's: the 16 kHz conversion (a
+stereo file is mixed down), the level, the segment files, Talk's listener and the hub uplink all run as for a microphone.
+The engine's input is never opened (no tap, no voice processing; a route change and `turnOnVoiceProcessing` change
+nothing), so the microphone permission isn't asked for, and no virtual sound card or system audio setting is involved;
+the players of a room meeting still play through the engine's output. Pause stops the file and Continue goes on from
+there; after the file's end silence comes at the same pace until Stop.
+
+### The tape
+
+A run with `-openMeetingAudio` also writes the tape of the meeting it records (`MeetingTapeRecorder`, following
+`MeetingTranscription` and `MeetingConversation` through Observation; nothing in the meeting's own code knows of it) to
+the app's Documents/meeting-tapes/`<recording id>`.json, a second after each change and at once at Stop, then with the
+minutes once the hub wrote them (read every 15 seconds for up to 20 minutes; a tape that ended without them waits on at
+the next launch of such a run). Get it from the simulator with
+`xcrun simctl get_app_container <udid> <bundle id> data` (Documents/meeting-tapes/ under it); a tape folder keeps the
+tape as tape.json with its audio beside it.
+
+`MeetingTape` (JSON, `format` `persona-meeting-tape`, `version` 1; times in seconds):
+
+| Field | What |
+| --- | --- |
+| `title`, `finalTitle` | The title the meeting started with, and the one it had at the end (the hub may name it) |
+| `startedAt` | When the recording started (ISO 8601) |
+| `audio` | The audio file's name; the recording's 0 is the file's 0 |
+| `locale`, `transcription`, `service`, `role` | The language, `hub` or `device` as asked, the speech service, Persona's role at the start |
+| `endedAfter`, `duration` | Seconds after the start when Stop was pressed, and the recording's length then |
+| `events[]` | Every change the room was shown, in the order it came: `kind`, `t` (seconds after the start when it reached the app), `at` (the recording's position then), and the kind's fields |
+| `minutes`, `minutesState`, `minutesAfter` | The minutes as the hub wrote them (`RecordingMinutes`), its `minutes_state`, and when they came |
+| `phoneLines` | The phone's own lines (its on-device transcript) at the end, when it had any |
+
+The events' kinds: `interim` (the hub's caption: `start`, `text`; no `text` once it went), `line` (a line of the live log:
+`n`, `start`, `end`, `text`, `source`), `topics` (the whole list, the map), `highlights` (the whole list), `room` (the
+room's state) and `problem` (the transcription's standing problem, `text` its code). `MeetingTape.frame(at:)` is what the
+room holds at a moment.
+
+### Replay
+
+`-showMeetingReplay <tape>` (an absolute path to a tape or a tape folder, a name in Documents/meeting-tapes, or `sample`
+for the made-up `MeetingTapeSample`), with `-showMeetingReplaySpeed 1|2|4` (0.25 to 16) and `-showMeetingReplayEnd YES`
+(the meeting ends by itself at the tape's end; otherwise it goes on, silent, until End). Open the Recordings page
+(`-openShellPage recordings`) and the room comes up: a made-up room meeting (`MeetingReplay.id`), Persona answering on
+screen, started with the live view and the highlights, records itself with no microphone while the tape's events reach
+the room's stores at `t` divided by the speed: the captions and lines into `MeetingTranscription` as hub transcription
+has them, the room, the topics and the highlights into `MeetingConversation`. The replayed meeting stays off every hub
+(`MeetingReplay.holds`): `RecordingSync.status` never makes it pending, `MeetingConversation` never reads its `…/live`,
+it asks for no hub transcription (so no audio socket and no gap upload), and after End its minutes are the tape's.
+
+The tape holds what the room's stores held, not the room's own conversation: Persona's messages in the thread aren't
+on it, so the replayed Live box keeps its last lines unfolded where the meeting's folded to its newest line under the
+thread.
+
+To see the hub's current highlights and map logic on the same audio, record it again: start a meeting with
+`-openMeetingAudio` and the tape's audio, then compare the new tape with the old one.
+
+Real meetings' audio and tapes hold other people's words: they stay on the machine that made them, never in the
+repository, a gist, an issue or a PR. The repository has only the made-up sample: `MeetingTapeSample` and its
+JSON, apple/PersonaTests/Fixtures/meeting-tape/tape.json, with its audio, apple/PersonaTests/Fixtures/meeting-tape/audio.m4a
+(macOS `say` in two voices, the same words at the same times).
+
+Tests: `MeetingTapeTests` (the fixture is the made-up tape and survives a round trip, a frame at each moment, a line read
+again in its place, the schedule at 1×, 2× and 4×, the speed's bounds, the replay held away from sync and showing the
+hub's lines and the room's lists, the launch argument, the file's real-time pace and pause, a writer recording the
+file as a microphone); `MeetingReplayUITests` against the mock hub (the made-up tape at 2×: the lines one by one, the
+two highlights, the map's three topics, End with the tape's minutes and nothing at the mock; a meeting started with
+`-openMeetingAudio`: no prompt, the file's audio up the audio socket in hub transcription and the hub's lines back in
+the room). PERSONA_SHOTS saves `replay-<appearance>-live|live-end|highlights|map|end|after|minutes|file-input`.
 
 ## All-day recording (Apple)
 
