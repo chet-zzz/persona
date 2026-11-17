@@ -2,7 +2,7 @@
 // shapes Claude Code keeps them (server/internal/transcript/testdata/claude-queued-images.jsonl, node keepImagePaths).
 import { describe, expect, it } from "vitest";
 import { contextXML, withContexts } from "./links";
-import { parseQueued, queuedDraft, queuedMarks } from "./queue";
+import { parseQueued, queuedDraft, queuedMarks, relayedFrom } from "./queue";
 
 const A = "/Users/me/.persona/uploads/2026-11-10/aaaa1111.jpg";
 const B = "/Users/me/.persona/uploads/2026-11-10/bbbb2222.jpg";
@@ -82,5 +82,30 @@ describe("queuedMarks", () => {
       { kind: "context", count: 1 },
     ]);
     expect(queuedMarks(parseQueued("just words"))).toEqual([]);
+  });
+});
+
+describe("relayedFrom", () => {
+  it("reads the title and the words of a conversation_send relay", () => {
+    expect(relayedFrom("来自「主对话」：帮我看下日程")).toEqual({ from: "主对话", text: "帮我看下日程" });
+  });
+
+  it("trims the title", () => {
+    expect(relayedFrom("来自「  日报  」：汇总")).toEqual({ from: "日报", text: "汇总" });
+  });
+
+  it("returns null for lines that are not a relay", () => {
+    expect(relayedFrom("日报的通知")).toBeNull();
+    expect(relayedFrom("督办消息")).toBeNull();
+    expect(relayedFrom("请看 来自「主对话」：不在开头")).toBeNull();
+  });
+
+  it("returns null for an empty title", () => {
+    expect(relayedFrom("来自「」：内容")).toBeNull();
+    expect(relayedFrom("来自「  」：内容")).toBeNull();
+  });
+
+  it("keeps newlines in the words", () => {
+    expect(relayedFrom("来自「主对话」：第一行\n第二行\n")).toEqual({ from: "主对话", text: "第一行\n第二行\n" });
   });
 });
