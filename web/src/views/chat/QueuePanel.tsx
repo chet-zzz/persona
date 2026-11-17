@@ -15,7 +15,8 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, errorText, sessionPath } from "../../lib/api";
 import { agentLabel } from "../../lib/mentions";
-import { keepAllBut, moved, movedTo, parseQueued, queuedMarks, relayedFrom } from "../../lib/queue";
+import { keepAllBut, moved, movedTo, parseQueued, queuedMarks } from "../../lib/queue";
+import { relayedFrom } from "../../lib/queue-relayed";
 import type { Session } from "../../lib/types";
 import { hasFinePointer } from "../../lib/viewport";
 import { Collapse, cx, Spinner, toast } from "../../ui/atoms";
