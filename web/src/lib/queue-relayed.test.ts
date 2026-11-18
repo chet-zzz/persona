@@ -22,6 +22,14 @@ describe("relayedFrom", () => {
     expect(relayedFrom("来自「  」：内容")).toBeNull();
   });
 
+  it("ends the title at the first 」：, so words that open with a quoted phrase stay whole", () => {
+    expect(relayedFrom("来自「主对话」：「用户追加：『看下日程』」：请处理")).toEqual({
+      from: "主对话",
+      text: "「用户追加：『看下日程』」：请处理",
+    });
+    expect(relayedFrom("来自「主对话」：「甲」：乙")).toEqual({ from: "主对话", text: "「甲」：乙" });
+  });
+
   it("keeps newlines in the words", () => {
     expect(relayedFrom("来自「主对话」：第一行\n第二行\n")).toEqual({ from: "主对话", text: "第一行\n第二行\n" });
   });

@@ -321,6 +321,21 @@ describe("QueuePanel relayed group", () => {
     expect(toggle(0).getAttribute("aria-expanded")).toBe("false");
   });
 
+  it("measures again on closing, so a line opened while cut and widened to fit keeps no toggle", () => {
+    cutLines(true);
+    show(["来自「主对话」：一段很长很长的话"], 1);
+    click(summary());
+    click(toggle(0));
+    expect(toggle(0).getAttribute("aria-expanded")).toBe("true");
+    cutLines(false); // the composer widened while the line was open
+    expect(toggle(0).getAttribute("aria-expanded")).toBe("true");
+    click(toggle(0));
+    expect(host.querySelector("[data-queue-relayed-toggle]")).toBeNull();
+    expect(body(0).className).toContain("truncate");
+    click(body(0));
+    expect(body(0).className).toContain("truncate");
+  });
+
   it("offers no toggle when the relayed line fits", () => {
     cutLines(false);
     show(["来自「主对话」：短"], 1);
