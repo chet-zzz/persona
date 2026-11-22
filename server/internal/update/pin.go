@@ -42,12 +42,27 @@ var tagVersion = lazyre.New(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
 // repository's releases/latest/download, the release's own releases/download/v<version>, which a newer release does
 // not change. "" for any other base: there they are only beside latest.json.
 func releaseBase(base, version string) string {
-	repo := githubLatestRepo(strings.TrimSuffix(base, "/"))
-	if repo == "" || !tagVersion.MatchString(version) {
+	if !tagVersion.MatchString(version) {
 		return ""
+	}
+	var repo string
+	trimmed := strings.TrimSuffix(base, "/")
+	if repo = githubLatestRepo(trimmed); repo == "" {
+		u, err := url.Parse(trimmed)
+		if err != nil || u.Scheme != "https" || u.Host != "github.com" || !strings.HasSuffix(u.Path, BetaFeedPath) {
+			return ""
+		}
+		repo = strings.TrimSuffix(u.Path, BetaFeedPath)
+		if len(strings.Split(strings.Trim(repo, "/"), "/")) != 2 {
+			return ""
+		}
 	}
 	return (&url.URL{Scheme: "https", Host: "github.com", Path: repo + "/releases/download/v" + version}).String()
 }
+
+// ReleaseBase is the immutable GitHub release-tag base for a moving update source, or "" for other sources.
+// Managers use it to choose the release layout before trying the legacy versioned-directory download.
+func ReleaseBase(base, version string) string { return releaseBase(base, version) }
 
 // MovedError is a download that did not match the release checked because its source serves another release now
 // (Now): one published between the check and the download. It wraps the mismatch (IsMismatch).

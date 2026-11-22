@@ -85,16 +85,6 @@ nonisolated struct SpaceGroup: Identifiable, Sendable {
     }
 }
 
-extension Session {
-    /// Nothing to look at now, but a /loop that has not fired yet, background work still running, or the hub waiting it
-    /// out (`WorkState.hubWaits`: a retry, a wake after a deploy) will wake it: new messages may come in minutes.
-    /// Waiting in the list.
-    nonisolated var isWaiting: Bool {
-        isQuiet && (listWaiting ?? (loop != nil || !(background ?? []).isEmpty || (subagents ?? []).contains(where: \.running)
-            || work?.hubWaits == true || !runningWorkflows.isEmpty))
-    }
-}
-
 extension DevGrouping {
     /// The groupings offered: 「按待办」 needs the hub's todos (an old hub answers 404 and has none), By Pinned the hub's
     /// direction tree (#4352).
@@ -238,6 +228,8 @@ struct ChatsView: View {
     /// Which space page sits at which depth of `path` (only this view pushes them), so a chat opened from a space
     /// page goes back to it instead of stacking another copy.
     @State private var spaceAt: [Int: String] = [:]
+    /// Opens a space's page from a chat on this page (`\.openSpace`): the same object for the page's life (#10303).
+    @State private var spaceOpener = SpaceOpener()
     @State private var query = ""
     @State private var searching = false
     /// What was searched for when a result was opened: closing the search empties the system field (our text stays,
@@ -326,23 +318,24 @@ struct ChatsView: View {
     /// first and pushes on the next turn of the run loop. The search's text and results stay for coming back.
     private var pushing: Binding<NavigationPath> {
         Binding(get: { path }, set: { new in
-            guard searching, new.count > path.count else { return path = new }
+            guard new.count > path.count else { return path = new }
             #if os(iOS) || os(visionOS)
-            if ownsTop {
-                // Our own field holds no navigation bar up: the search closes (the keyboard goes, the text and the
-                // results stay for coming back) and the page goes on at once.
+            if ownsTop, searching || header.floating {
+                // The custom field holds no navigation bar up: close it and push in the same turn.
+                header.closeSearchForPush(wasSearching: searching)
                 searching = false
-                header.floating = false
-                header.up = false
-                header.setCompact(false)
                 return path = new
             }
             #endif
+            guard searching else { return path = new }
             searchedBeforePush = query
             searching = false
             DispatchQueue.main.async { path = new }
         })
     }
+
+    /// Programmatic list opens close the custom field just like a NavigationLink. System search keeps its own closing.
+    private var listPushPath: Binding<NavigationPath> { ownsTop ? pushing : $path }
 
     var body: some View {
         #if DEBUG || PERF_SIGNPOST
@@ -425,15 +418,15 @@ struct ChatsView: View {
         #if os(iOS) || os(visionOS)
         .overlay {
             if ownsTop, path.isEmpty {
-                AgentsSearchOverlay(header: header, shell: shell != nil, query: $query, focused: riseSearch,
-                                    cancel: endSearch)
+                AgentsSearchOverlay(header: header, shell: shell != nil, query: $query, begin: beginSearch,
+                                    focused: riseSearch, cancel: endSearch)
             }
         }
         #endif
         .animation(Theme.Motion.state, value: path.isEmpty)
-        .environment(\.openSpace) { space in
+        .environment(\.openSpace, spaceOpener.set { space in
             if spaceAt[path.count - 2] == space { path.removeLast() } else { pushSpace(space) }
-        }
+        })
     }
 
     /// The list column: its own property, so Xcode 26.0 type-checks it apart from the split around it (#5333, #7173).
@@ -477,26 +470,35 @@ struct ChatsView: View {
 
     /// Stage 2: the bar's items (on the Mac, buttons in the list column's own title row) and New Session's sheet.
     private func listColumnBar(_ column: some View) -> some View {
-        column
-            // The Mac's buttons are in the list column's own title row (below); the shell is the phone's.
-            #if os(iOS) || os(visionOS)
-            .pageToolbar { barItems }
-            #else
-            // In the list column's own title row, at its trailing edge (#1223): as window toolbar items they followed
-            // the window's middle, not the column (in the middle of the list at 920 wide, over the chat at 1800).
-            .overlay(alignment: .topTrailing) {
-                if shell == nil { // always on the Mac: its window is not the phone's shell
-                    HStack(spacing: Theme.Space.s) {
-                        MacTitleRowButton(String(localized: "Personal Agents"), symbol: Theme.Icon.personalAgents) { openFromList(PersonalAgentsRoute()) }
-                        MacTitleRowButton(String(localized: "New Session [Chats View 58e21b]"), symbol: Theme.Icon.compose) { newSession.wrappedValue = true }
-                    }
-                    .padding(.trailing, Theme.Space.l)
-                    .frame(height: Theme.Size.macToolbarHeight)
-                    .ignoresSafeArea(.container, edges: .top)
-                }
-            }
-            #endif
+        withBarItems(column)
             .sheet(isPresented: $showNew) { NewChatView { session in newSessionStarted(session) } }
+    }
+
+    @ViewBuilder private func withBarItems(_ column: some View) -> some View {
+        // The Mac's buttons are in the list column's own title row (below); the shell is the phone's.
+        #if os(iOS) || os(visionOS)
+        if columnHidesBar {
+            column
+        } else if #available(iOS 26.0, *) {
+            column.pageToolbar { barItems }
+        } else {
+            column.pageToolbar { barItemsBeforeGlass }
+        }
+        #else
+        // In the list column's own title row, at its trailing edge (#1223): as window toolbar items they followed
+        // the window's middle, not the column (in the middle of the list at 920 wide, over the chat at 1800).
+        column.overlay(alignment: .topTrailing) {
+            if shell == nil { // always on the Mac: its window is not the phone's shell
+                HStack(spacing: Theme.Space.s) {
+                    MacTitleRowButton(String(localized: "Personal Agents"), symbol: Theme.Icon.personalAgents) { openFromList(PersonalAgentsRoute()) }
+                    MacTitleRowButton(String(localized: "New Session [Chats View 58e21b]"), symbol: Theme.Icon.compose) { newSession.wrappedValue = true }
+                }
+                .padding(.trailing, Theme.Space.l)
+                .frame(height: Theme.Size.macToolbarHeight)
+                .ignoresSafeArea(.container, edges: .top)
+            }
+        }
+        #endif
     }
 
     /// Stage 3: following the stack: the shell told where the page is, the path, the sidebar's pick and the Agents tab
@@ -509,7 +511,7 @@ struct ChatsView: View {
             .onChange(of: workAtRoot, initial: true) { _, root in shell?.workAtRoot = root }
             .onChange(of: path) { _, p in stackPathChanged(to: p) }
             .onChange(of: pickedRoot) { _, root in sidebarRootPicked(root) }
-            .onChange(of: model.agentsListReveal) { _, request in revealAgentsList(request) }
+            .background { AgentsRevealWatch { request in revealAgentsList(request) } }
     }
 
     /// Stage 4: taking what is asked for from outside, the list's first appearance and the assistant's switches.
@@ -524,39 +526,78 @@ struct ChatsView: View {
     #if os(iOS) || os(visionOS)
     /// The list column's bar items (`listColumnBar`): an empty middle while the shell's own bar floats over this one,
     /// else the page's own.
+    @available(iOS 26.0, *)
     @ToolbarContentBuilder private var barItems: some ToolbarContent {
-        if shell != nil || (ownsTop && header.up) {
-            // The shell's own bar floats over this one (AgentsTopBar). Searching on a phone the field takes
-            // the bar's row: no title under it either.
-            ToolbarItem(placement: .principal) { Color.clear.frame(width: Theme.Size.hairline) }
-                .sharedBackgroundVisibility(.hidden)
+        if barFloatsOver {
+            emptyMiddle.sharedBackgroundVisibility(.hidden)
         } else {
-            // Not on the Mac (#907): the connection state is at the foot of the window's sections column (and
-            // the page's while that is hidden), and holding the bar's middle this empty item pushed New Session
-            // out of the list column, an empty stretch to its left over the conversation. Without it the
-            // button sits at the list column's trailing edge, by the conversation, as Mail's compose does.
-            ToolbarItem(placement: .principal) { ConnectionTitle() }
-            // On the Mac the shell shows it, next to its sidebar button (MacShell).
-            ToolbarItem(placement: .topBarLeading) { AgentsListMenu(actions: menuActions) }
-            if showsPersonalEntry {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { openFromList(PersonalAgentsRoute()) } label: { Label("Personal Agents", systemImage: Theme.Icon.personalAgents) }
-                        .accessibilityIdentifier("agents.personal")
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { newSession.wrappedValue = true } label: { Label("New Session [Chats View 58e21b]", systemImage: Theme.Icon.compose) }
-            }
+            pageItems
             #if os(iOS)
             // Where the system's Hide Sidebar was, in a glass circle of its own as that one: the column is slid
             // by a finger now (#4206).
-            if widthClass == .regular && unified == nil {
+            if showsHideList {
                 ToolbarSpacer(.fixed, placement: .topBarTrailing)
-                ToolbarItem(placement: .topBarTrailing) { SplitHideListButton() }
+                hideListItem
             }
             #endif
         }
     }
+
+    /// `barItems` before iOS 26 (#6730): the bar has no glass behind its items to hide or to keep apart.
+    @ToolbarContentBuilder private var barItemsBeforeGlass: some ToolbarContent {
+        if barFloatsOver {
+            emptyMiddle
+        } else {
+            pageItems
+            #if os(iOS)
+            if showsHideList { hideListItem }
+            #endif
+        }
+    }
+
+    /// The one sidebar's column hides its navigation bar (`agentsColumn`); its head and its Agents heading have the bar's
+    /// buttons. Handed to the hidden bar all the same, UIKit was given them anew, their images looked up again, each time
+    /// the column came back into the window: about a fifth of the main thread of every switch between the tabs of the
+    /// open iPhone Duo or the iPad (#10303).
+    private var columnHidesBar: Bool {
+        #if os(iOS)
+        unified != nil
+        #else
+        false
+        #endif
+    }
+
+    /// The shell's own bar floats over this one (AgentsTopBar). Searching on a phone the field takes the bar's row: no
+    /// title under it either.
+    private var barFloatsOver: Bool { shell != nil || (ownsTop && header.up) }
+
+    private var emptyMiddle: some ToolbarContent {
+        ToolbarItem(placement: .principal) { Color.clear.frame(width: Theme.Size.hairline) }
+    }
+
+    @ToolbarContentBuilder private var pageItems: some ToolbarContent {
+        // Not on the Mac (#907): the connection state is at the foot of the window's sections column (and
+        // the page's while that is hidden), and holding the bar's middle this empty item pushed New Session
+        // out of the list column, an empty stretch to its left over the conversation. Without it the
+        // button sits at the list column's trailing edge, by the conversation, as Mail's compose does.
+        ToolbarItem(placement: .principal) { ConnectionTitle() }
+        // On the Mac the shell shows it, next to its sidebar button (MacShell).
+        ToolbarItem(placement: .topBarLeading) { AgentsListMenu(actions: menuActions) }
+        if showsPersonalEntry {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { openFromList(PersonalAgentsRoute()) } label: { Label("Personal Agents", systemImage: Theme.Icon.personalAgents) }
+                    .accessibilityIdentifier("agents.personal")
+            }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { newSession.wrappedValue = true } label: { Label("New Session [Chats View 58e21b]", systemImage: Theme.Icon.compose) }
+        }
+    }
+
+    #if os(iOS)
+    private var showsHideList: Bool { widthClass == .regular && unified == nil }
+    private var hideListItem: some ToolbarContent { ToolbarItem(placement: .topBarTrailing) { SplitHideListButton() } }
+    #endif
     #endif
 
     /// `path` became empty, or not (`listColumnProbes`).
@@ -707,7 +748,7 @@ struct ChatsView: View {
     }
 
     private func agentsList(rows: AnyView?) -> AgentsList {
-        AgentsList(path: $path, spaceAt: $spaceAt, query: $query, searching: $searching,
+        AgentsList(path: listPushPath, spaceAt: $spaceAt, query: $query, searching: $searching,
                    searchedBeforePush: $searchedBeforePush, showNew: newSession, menuActions: menuActions, ownsTop: ownsTop,
                    showsPersonalEntry: showsPersonalEntry, beginSearch: beginSearch, sidebarRows: rows)
     }
@@ -728,7 +769,7 @@ struct ChatsView: View {
             unified.select(.page(AnyHashable(key)), path: $path)
             unified.askedFromOutside = .page(AnyHashable(key)) // what the app came up for: kept through an assistant switch
         } else {
-            path = NavigationPath([key])
+            listPushPath.wrappedValue = NavigationPath([key])
         }
         #if DEBUG
         // `-openOverSpace YES` with `-openSession`: the chat on its space's page, a page under it (its ‹, #1337).
@@ -757,23 +798,26 @@ struct ChatsView: View {
         #if DEBUG
         SearchTrace.shared.note("begin listTop=\(header.listTop) scrolled=\(header.scrolled)")
         #endif
-        header.floating = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if header.floating { riseSearch() } } // no keyboard came
+        header.motion = 0
+        header.rising = true
+        let start = header.startSearch()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { riseSearch(start) } // no keyboard came
         #endif
     }
 
+    #if os(iOS) || os(visionOS)
     /// The floating field has the keyboard: up into the bar's row.
-    private func riseSearch() {
-        #if os(iOS) || os(visionOS)
-        guard !searching else { return }
+    private func riseSearch(_ start: UUID?) {
+        let listInFront = path.isEmpty && ownsTop && !leaving && model.selectedTabNow == .chats
+        guard !searching, header.completeSearchStart(start, listInFront: listInFront) else { return }
         var still = Transaction()
         still.disablesAnimations = true
         withTransaction(still) { searching = true }
         // Laid out for searching once the list has slid up with it (`ListShift.arrived`).
         header.rising = true
         withAnimation(Theme.Motion.state) { header.up = true }
-        #endif
     }
+    #endif
 
     /// 「取消」: the whole list again, at once (results and list drawn together ghosted), from its top with the field out;
     /// the field goes back down into the row, the shell's bar fading back as it goes.
@@ -782,6 +826,7 @@ struct ChatsView: View {
         var still = Transaction()
         still.disablesAnimations = true
         withTransaction(still) { query = "" }
+        if header.cancelPendingSearch() { return }
         // Laid out at rest again, drawn where it is (shifted up by the difference), then down with the field.
         header.setCompact(false)
         // A turn later, once the whole list is in and laid out again.
@@ -920,8 +965,10 @@ private struct AgentsList: View {
     @StoredValue("dev.pinnedOnly") private var pinnedOnly = false
     @StoredValue("dev.searchScope") private var searchScope: AgentSearchScope = .all
     @StoredValue("dev.searchAsCode") private var searchAsCode = false
-    /// Several groups of hubs: the one the list shows ("" = all; `HubFilter`).
-    @StoredValue(HubFilter.key) private var hubFilter = ""
+    /// Several groups of hubs: "" all of them, else the list is narrowed to one (`HubFilter`).
+    @StoredValue(HubFilter.key) private var storedHubFilter = ""
+    /// The group the list shows when narrowed: the current hub's (`HubFilter.shown`, #11657).
+    private var hubFilter: String { HubFilter.shown(storedHubFilter, current: model.hub?.group) }
     @StoredValue("dev.grouping") private var storedGrouping: DevGrouping = .standard // by repository first (#2108)
     /// The grouping in use (`DevGrouping.resolved`).
     private var grouping: DevGrouping { DevGrouping.resolvedNow(storedGrouping) }
@@ -933,6 +980,7 @@ private struct AgentsList: View {
     /// Folded sections (spaces, machines, states), one id per line.
     @StoredValue("dev.folded") private var foldedList = ""
     @State private var quick: AgentFilter = .all
+    @State private var showHiddenDirectories = false
     @State private var paginationArmed = false
 
     private var selectedHub: String? {
@@ -942,6 +990,7 @@ private struct AgentsList: View {
 
     private var listQuery: SessionListQuery {
         var q = SessionListQuery(state: quick.state?.rawValue ?? "", text: query)
+        q.includeHidden = showHiddenDirectories
         if !machineFilter.isEmpty { q.machine = MachineRef(path: machineFilter).id }
         let links = model.links.filter { selectedHub == nil || $0.group == selectedHub }
         let pins = links.contains { !$0.pins.pins.sessions.isEmpty || !$0.pins.pins.spaces.isEmpty }
@@ -975,7 +1024,7 @@ private struct AgentsList: View {
     /// The agents, the questions and the machines the list shows (`AgentsFeed`): held still while it is scrolled or
     /// out of sight.
     @State private var feed = AgentsFeed()
-    #if DEBUG
+    #if DEBUG && os(iOS)
     @State private var sortShadow = AgentSortShadowObserver()
     #endif
 
@@ -1055,7 +1104,7 @@ private struct AgentsList: View {
                      searchScope: searchScope, searchAsCode: searchAsCode,
                      machine: machineFilter, harness: harnessFilter, project: projectFilter, model: modelFilter,
                      pinnedOnly: pinnedOnly, hub: hubFilter, multiHub: model.isMultiHub, kept: kept,
-                     held: model.heldInList, preferences: preferences,
+                     held: model.heldInList, heldJustFinished: model.heldJustFinished, preferences: preferences,
                      pagedGroups: Set(model.sessionLists.lists.filter { $0.value.paged }.keys),
                      listQuery: listQuery, sideFold: model.sideFoldGroups)
     }
@@ -1082,7 +1131,7 @@ private struct AgentsList: View {
 
     @discardableResult
     private func shadowSubmit(active: [SpaceGroup], quiet: [SpaceGroup]) -> Int {
-        #if DEBUG
+        #if DEBUG && os(iOS)
         guard sortShadow.enabled else { return 0 }
         let snapshot = shadowPresentation(active + quiet)
         sortShadow.submit(feed: feed, settings: projectionSettings(), presentation: snapshot)
@@ -1092,7 +1141,7 @@ private struct AgentsList: View {
         #endif
     }
 
-    #if DEBUG
+    #if DEBUG && os(iOS)
     private func shadowPresentation(_ groups: [SpaceGroup]) -> AgentSortPresentation {
         guard sortShadow.enabled else { return .init() }
         var result = AgentSortPresentation(folded: folded, expandedIdle: expandedIdle,
@@ -1185,8 +1234,9 @@ private struct AgentsList: View {
         let pinnedAgents = projection.pinnedAgents
         // One row per session that waits for the user, its cards under it (`AgentsNeedsYou`): the section, the Needs
         // You filter and the tab's badge count these rows.
+        let cardSession = model.cardSessionResolver() // the same row for a card here as in the counts
         let waiting = AgentsNeedsYou.rows(
-            cards: AgentsNeedsYou.cards(feed.following ? feed.interactions : model.scopedInteractions, session: session,
+            cards: AgentsNeedsYou.cards(feed.following ? feed.interactions : model.scopedInteractions, session: { cardSession($0) ?? session($0) },
                                         machine: machineFilter, hub: model.isMultiHub ? hubFilter : nil),
             waiting: AgentsNeedsYou.waiting(base)) // a folded child's card sits under its parent; a subtask the hub did not fold stays its own row
         let _ = (lookup.needsYou = waiting.count)
@@ -1209,7 +1259,9 @@ private struct AgentsList: View {
                                    foldAll: { setFolded(folding($0, true, in: folded)); expandedQuiet = [] },
                                    unfoldAll: { setFolded(Set(Self.foldedByDefault.union(Self.foldedByChoice).map { "!" + $0 })) },
                                    onMachines: { openFromList(MachineListRoute()) },
-                                   onTerminals: { openFromList(TerminalsRoute()) })
+                                   onTerminals: { openFromList(TerminalsRoute()) },
+                                   showingHidden: showHiddenDirectories,
+                                   toggleHidden: { showHiddenDirectories.toggle() })
         #if os(macOS)
         let _ = macRows.update(rowsInOrder(unpinned: unpinned, pinned: pinnedAgents, active: active, quiet: quiet, tree: tree, byHost: byHost))
         #endif
@@ -1277,6 +1329,9 @@ private struct AgentsList: View {
             if let sidebarRows {
                 Section { sidebarRows }
                     .listSectionSeparator(.hidden)
+                    // No sections' gap before the Agents heading: it stands as far below Persona's last row as Persona
+                    // Chats below the pages', its own heading's room only (`SidebarHeadingBox`, #10551).
+                    .listSectionSpacing(.custom(Theme.Space.flush))
             }
             // On a phone the filter bar is the list's first row: it scrolls with the list, so the search field can
             // fold away and come back on a pull (a bar pinned in the safe area stayed put under a folded search field,
@@ -1511,7 +1566,8 @@ private struct AgentsList: View {
         // takes the title's place: empty while all is well, Connecting… and the like while the hub is out of reach
         // (toolbar(removing: .title) would hide that too).
         .navigationBarTitleDisplayMode(.inline)
-        .modifier(AgentsTop(ownsTop: ownsTop, searchClose: searchClose))
+        .modifier(AgentsTop(ownsTop: ownsTop, searchClose: searchClose,
+                            retainsQuery: AgentsSearchVisibility.retained(query: query)))
         #if (DEBUG || PERF_SIGNPOST) && (os(iOS) || os(visionOS))
         .background { if ScreenProbe.enabled { AgentsScrollProbe(page: shell == nil ? nil : "agents") } }
         #endif
@@ -1593,8 +1649,11 @@ private struct AgentsList: View {
         .onChange(of: query) { _, now in SearchTrace.shared.note("query '\(now)'") }
         #endif
         .onChange(of: machineFilter) { _, _ in kept = [] }
+        // Narrowed to one hub, another one made current (#11657): a computer of the hub before is not on this list, also
+        // when the switch was made while the list was not there.
+        .modifier(MachineFilterFollowsHub(hubFilter: hubFilter, machineFilter: $machineFilter))
         .onAppear {
-            #if DEBUG
+            #if DEBUG && os(iOS)
             sortShadow.enable()
             #endif
             feed.follow(model)
@@ -1885,10 +1944,18 @@ private struct AgentsList: View {
     /// display, fold all), Personal Agents and New Session, which the Agents page has in its bar.
     private var unifiedAgentsHeading: some View {
         HStack(spacing: Theme.Space.xs) {
-            Text("Agents").font(Theme.Font.captionStrong).foregroundStyle(.secondary).lineLimit(1)
-                .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: Theme.Space.s)
-            AgentsListMenu(actions: menuActions)
+            // The name in the Persona rows' heading box (`SidebarHeadingBox`, #10551): the row is as tall as Pages' and
+            // Persona Chats', its buttons sit in it, and it stands as far below the row before it.
+            HStack(spacing: Theme.Space.xs) {
+                Text("Agents").font(Theme.Font.captionStrong).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: Theme.Space.s)
+            }
+            .modifier(SidebarHeadingBox())
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("sidebar-agents-heading")
+            // In a view graph of its own: the list's updates replaced the open menu and scrolled it to its top (#10738).
+            MenuIsland(content: SidebarAgentsListMenu(actions: menuActions))
             if showsPersonalEntry {
                 Button { openFromList(PersonalAgentsRoute()) } label: {
                     ThemedIcon(Theme.Icon.personalAgents).font(Theme.Font.label).foregroundStyle(.secondary)
@@ -1911,20 +1978,18 @@ private struct AgentsList: View {
         // Where the Persona rows' headings start (their row's inset and their own), so the three headings line up.
         .padding(.leading, Theme.Space.s + Theme.Space.m)
         .padding(.trailing, Theme.Space.s)
-        .padding(.top, Theme.Space.s)
-        .scaledFrame(minHeight: Theme.Size.tapTarget)
+        .padding(.top, SidebarHeadingBox.above)
         // The Separate layout's Agents tab has no Pages heading for the head to place its face by (`rowsLeading`): it
         // takes the Persona tab's line (`linedUpWith`, #8596). Before the Persona tab is laid out this heading gives an
         // estimate, its row's start plus the Persona rows' extra inset on an iPad. Without either the face sat
         // `Theme.Space.xl` in, 4 pt left of the Persona tab's (#8359).
         .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(UnifiedSidebar.columnSpace)).minX } action: { x in
             guard sidebarRows == nil, let unified, x >= 0 else { return }
-            let leading = unified.linedUpWith?.ui.rowsLeading ?? x + Theme.Space.s
-            if unified.ui.rowsLeading != leading { unified.ui.rowsLeading = leading }
+            unified.ui.placeRows(at: unified.linedUpWith?.ui.rowsLeading ?? x + Theme.Space.s)
         }
         .onChange(of: sidebarRows == nil ? unified?.linedUpWith?.ui.rowsLeading : nil, initial: true) { _, line in
-            guard let line, let unified, unified.ui.rowsLeading != line else { return }
-            unified.ui.rowsLeading = line
+            guard let line, let unified else { return }
+            unified.ui.placeRows(at: line)
         }
         .id(UnifiedSidebar.agentsAnchor)
     }
@@ -1961,11 +2026,8 @@ private struct AgentsList: View {
     private func openFromSearch(_ key: SessionKey) {
         #if os(iOS) || os(visionOS)
         if ownsTop {
+            // The compact path binding closes the custom field before pushing (`AgentsHeader.closeSearchForPush`).
             // Nothing to wait for: our own field holds no navigation bar up. The text and results stay.
-            searching = false
-            header.floating = false
-            header.up = false
-            header.setCompact(false)
             path.append(key)
             return
         }
@@ -2144,7 +2206,7 @@ private struct AgentsList: View {
             .accessibilityIdentifier("agents.space")
             TodoSpaceTag(group: g) { todoID in openFromList(TodoDetailRoute(id: todoID)) }
             Menu {
-                SpaceHeaderMenu(group: g, rename: { renamingSpace = g }, open: { openFromList(SpaceRoute(id: g.id)) },
+                SpaceHeaderMenu(group: g, isMuted: model.isMuted, rename: { renamingSpace = g }, open: { openFromList(SpaceRoute(id: g.id)) },
                                 linkTodo: { linkingSpace = g }).equatable()
             } label: {
                 headerMenuLabel
@@ -2335,7 +2397,7 @@ private struct AgentsList: View {
     @ViewBuilder private func repoMenu(_ r: RepoTree.Repo) -> some View {
         let prepared = lookup.projection?.repositories[r.id]
         if let space = prepared?.space {
-            SpaceHeaderMenu(group: space, rename: { renamingSpace = space }, open: { openFromList(SpaceRoute(id: space.id)) },
+            SpaceHeaderMenu(group: space, isMuted: model.isMuted, rename: { renamingSpace = space }, open: { openFromList(SpaceRoute(id: space.id)) },
                             linkTodo: { linkingSpace = space }).equatable()
             TodoSpaceMenuItem(group: space) { todoID in openFromList(TodoDetailRoute(id: todoID)) }
         } else {
@@ -2504,7 +2566,7 @@ private struct AgentsList: View {
             if space != nil || !unread.isEmpty {
                 Menu {
                     if let space {
-                        SpaceHeaderMenu(group: space, rename: { renamingSpace = space }, open: { openFromList(SpaceRoute(id: space.id)) },
+                        SpaceHeaderMenu(group: space, isMuted: model.isMuted, rename: { renamingSpace = space }, open: { openFromList(SpaceRoute(id: space.id)) },
                                         linkTodo: { linkingSpace = space }).equatable()
                     } else {
                         RepoMenuItems(unread: unread).equatable()
@@ -2621,28 +2683,33 @@ private struct AgentsList: View {
 
     // MARK: Recently active
 
+    #if !os(iOS)
     private func workspaceAgentMenu(_ s: Session) -> AgentRowMenu {
-        #if os(iOS)
-        return AgentRowMenu(facts: AgentActionFacts(session: s, model: model), handlers: rowActions)
-        #else
-        return AgentRowMenu(key: s.key, pinned: model.isPinned(s.key), muted: model.isMuted(s), looping: s.loop != nil,
+        AgentRowMenu(key: s.key, pinned: model.isPinned(s.key), muted: model.isMuted(s), looping: s.loop != nil,
                      live: s.state.isLive, terminal: s.canTerminal, renamable: s.canRename, closable: s.canClose,
                      attachable: s.canAttach, deletable: s.canDelete,
                      paneActions: NodeMenu.offersPaneActions(s), actions: rowActions)
-        #endif
     }
+    #endif
 
 
     @ViewBuilder private func worktreeMenu(_ worktree: RepoTree.Worktree, agent: Session? = nil) -> some View {
         if let target = worktree.workspace {
             let direct = ordered(WorkspaceNavigation.directSessions(target, inventory: model.sessionsNow, catalog: workspaceCatalog.workspaces))
-            WorktreeSidebarMenu(workspace: target, parent: workspaceCatalog.workspaces.first { $0.key == target.parentKey },
-                                sessions: direct, agent: agent, menus: direct.map(workspaceAgentMenu),
-                                open: { target in
-                                    if target.key == worktree.workspace?.key { openWorktree(worktree) }
-                                    else { openWorktree(target) }
-                                }, newSession: { startingWorktree = $0 }, newChild: { creatingChild = $0 },
+            let parent = workspaceCatalog.workspaces.first { $0.key == target.parentKey }
+            let open: (HostWorkspace) -> Void = { target in
+                if target.key == worktree.workspace?.key { openWorktree(worktree) } else { openWorktree(target) }
+            }
+            #if os(iOS)
+            WorktreeSidebarMenu(workspace: target, parent: parent, sessions: direct, agent: agent, handlers: rowActions,
+                                open: open, newSession: { startingWorktree = $0 }, newChild: { creatingChild = $0 },
                                 rename: { renamingWorktree = $0 }).equatable()
+            #else
+            WorktreeSidebarMenu(workspace: target, parent: parent, sessions: direct, agent: agent,
+                                menus: direct.map(workspaceAgentMenu),
+                                open: open, newSession: { startingWorktree = $0 }, newChild: { creatingChild = $0 },
+                                rename: { renamingWorktree = $0 }).equatable()
+            #endif
         }
     }
 
@@ -2680,7 +2747,7 @@ private struct AgentsList: View {
     // MARK: By state / by machine
 
     private var order: AgentListOrder {
-        AgentListOrder(isPinned: model.isPinned, isMuted: model.isMuted, byRank: quick == .all && sort == .state, held: model.heldInList)
+        AgentListOrder(isPinned: model.isPinned, isMuted: model.isMuted, byRank: quick == .all && sort == .state, held: model.heldInList, heldJustFinished: model.heldJustFinished)
     }
     /// By Machine's machines: those with live agents, in their own order; under Recently Updated the one with the latest agent first.
     /// The list and ↑ / ↓ (`rowsInOrder`) both go by it.
@@ -2704,6 +2771,7 @@ private struct AgentsList: View {
         ("awaiting", StateName.awaitsReply.text, StatusPalette.awaitingReply),
         ("working", StateName.working.text, StatusPalette.working),
         ("background", String(localized: "Waiting in the background"), StatusPalette.backgroundWaiting),
+        ("just_finished", StateName.justFinished.text, StatusPalette.unread),
         ("waiting", StateName.waiting.text, StatusTone(dot: Theme.loop, text: Theme.loop)),
         ("muted", String(localized: "Muted [Chats View b66705]"), StatusPalette.idle), ("idle", StateName.seen.text, StatusPalette.idle),
     ]
@@ -2744,6 +2812,13 @@ private struct AgentsList: View {
                     }
                     .modifier(FoldAnchor(id: id, reader: feed.reader))
                     .accessibilityIdentifier("agents.section")
+                    .contextMenu {
+                        if b.key == "just_finished", rows.contains(where: { $0.needsSeen() }) {
+                            Button { model.markSeen(rows.map(\.key)) } label: {
+                                Label(StateName.markAllSeen(), systemImage: Theme.Icon.success)
+                            }
+                        }
+                    }
                 }
                 .listSectionSpacing(isFolded(id) ? .custom(0) : .default)
             }
@@ -3201,6 +3276,9 @@ private struct AgentsList: View {
     private static let hostHeadingInsets = EdgeInsets(top: Theme.Space.l, leading: Theme.Space.page, bottom: Theme.Space.xs, trailing: Theme.Space.page)
     #endif
 
+    /// How far the Sidebar layout's selected shade reaches past an Agent row's content, into the row's insets (#11032).
+    private static let selectedOutset = EdgeInsets(top: -Theme.Space.xs, leading: -Theme.Space.s,
+                                                   bottom: -Theme.Space.xs, trailing: -Theme.Space.s)
     /// A capsule's room: the page's edges, a little air above and below.
     private static let capsuleInsets = EdgeInsets(top: Theme.Space.xs, leading: Theme.Space.page, bottom: Theme.Space.xs, trailing: Theme.Space.page)
     /// A capsule `level` levels in, under a working tree's row or a tab's starter: a level is as far in as a quiet space's
@@ -3377,14 +3455,19 @@ private struct AgentsList: View {
     /// An agent row's background: the tree's (`treeBackground`), none of its own in By Repository's cards on the Mac and
     /// in the floating list, else the list's.
     private func slotBackground(_ open: Bool) -> AnyView? {
-        if repoTree { return treeBackground(open) }
+        // The Sidebar layout's column shades its open Agent as its other rows (`SidebarSelectedShade`, `slotRowBody`).
+        if repoTree { return treeBackground(open && unified == nil) }
         return grouping == .repo || floating ? AnyView(Color.clear) : nil
     }
 
     /// The agent open beside the list in By Repository's cards (#2531; the split's list, not a phone's, whose list is
-    /// never beside a chat): its row is washed. The split's column is compact itself, so not its width class.
+    /// never beside a chat): its row is washed. The split's column is compact itself, so not its width class. In the
+    /// Sidebar layout's column (the drawer on a phone too) the root's Agent in every grouping (#11032): the column's one
+    /// selected row, as the main conversation's, a place's or a Persona chat's.
     private var treeOpenSession: SessionKey? {
-        repoTree && !ownsTop && openedWorkspace == nil ? shownAgent : nil
+        guard openedWorkspace == nil else { return nil }
+        if unified != nil { return shownAgent }
+        return repoTree && !ownsTop ? shownAgent : nil
     }
 
     private func treeSelected(_ key: SessionKey) -> Bool {
@@ -3394,7 +3477,7 @@ private struct AgentsList: View {
     /// The Agent whose row is shaded: the Sidebar layout's root while it is an Agent's chat, also with pages opened on it
     /// (#8359); elsewhere the chat on screen.
     private var shownAgent: SessionKey? {
-        if let unified { return unified.root.value?.base as? SessionKey }
+        if let unified { return unified.shownAgent }
         return model.visibleSession
     }
 
@@ -3444,6 +3527,11 @@ private struct AgentsList: View {
                 }
             }
         }
+            #if os(iOS)
+            // The Sidebar layout's one selected look (#11032): the shade under the main conversation's, a place's and a
+            // Persona chat's row, to the row's edges in every grouping.
+            .background { if open && unified != nil { SidebarSelectedShade().padding(Self.selectedOutset) } }
+            #endif
             .accessibilityIdentifier(compact ? "agents.compactRow" : "agents.row")
             .accessibilityAddTraits(open ? .isSelected : [])
             #if os(macOS)
@@ -3475,7 +3563,7 @@ private struct AgentsList: View {
                     Button { Task { await model.interrupt(s.key) } } label: { Label("Interrupt [Composer Buttons f9d193]", systemImage: Theme.Icon.interrupt) }
                         .tint(Theme.busy)
                 }
-                if s.state == .unread {
+                if s.needsSeen(muted: model.isMuted(s)) {
                     Button { model.markSeen(s.key) } label: { Label("Mark as Seen", systemImage: Theme.Icon.view) }
                         .tint(.gray)
                 }
@@ -3483,7 +3571,7 @@ private struct AgentsList: View {
             #endif
             .contextMenu { () -> AnyView in
                 #if os(iOS)
-                AnyView(AgentActionMenu(facts: AgentActionFacts(session: s, model: model), handlers: rowActions).equatable())
+                AnyView(AgentActionMenuReader(session: s, handlers: rowActions)) // not the row's to observe (#10231)
                 #else
                 AnyView(AgentRowMenu(s, model: model, actions: rowActions).equatable())
                 #endif
@@ -3567,7 +3655,12 @@ private struct KeyedRow<Key: Equatable & Sendable, Content: View>: View, Equatab
     nonisolated let key: Key
     @ViewBuilder let content: () -> Content
 
-    var body: some View { content() }
+    var body: some View {
+        #if DEBUG || PERF_SIGNPOST
+        let _ = PerfTrace.body("KeyedRow") // an Agents row built again (`RenderBudgetTests`)
+        #endif
+        content()
+    }
 
     nonisolated static func == (a: Self, b: Self) -> Bool { a.key == b.key }
 }
@@ -3832,14 +3925,7 @@ nonisolated struct AgentsListShown: Encodable, Equatable {
 
     /// The same machines as the list shows them: a machine's heartbeat (`lastSeen`, on every push of a busy hub) is
     /// shown only on the machines page, and drew the whole list again each time (#1495).
-    nonisolated static func sameListing(_ a: [Machine], _ b: [Machine]) -> Bool {
-        a.count == b.count && zip(a, b).allSatisfy { x, y in
-            guard x.lastSeen != y.lastSeen else { return x == y }
-            var y = y
-            y.lastSeen = x.lastSeen
-            return x == y
-        }
-    }
+    nonisolated static func sameListing(_ a: [Machine], _ b: [Machine]) -> Bool { AppModel.sameApartFromHeartbeat(a, b) }
 
     /// The rows that changed get their agent; the list gets the new list only if its structure changed.
     private func show(_ s: [Session]) {
@@ -4072,7 +4158,8 @@ struct QuickFilterBar: View, Equatable {
         }, selection: selection.rawValue, choose: { id in
             if let filter = AgentFilter(rawValue: id), filter != selection { choose(filter) }
         }) {
-            AgentsGroupingMenu(iconOnly: true)
+            // In a view graph of its own: the list's updates replaced the open menu and scrolled it to its top (#10738).
+            MenuIsland(content: AgentsGroupingMenu(iconOnly: true))
         }
     }
     #endif
@@ -4466,7 +4553,7 @@ nonisolated struct SlotRow: View, Equatable {
                         shape: taskShape(), isOpen: session.leadWorkflow != nil,
                         accessory: surface == .none || Self.endsInTime ? .none : .disclosure, titleLines: 2, subtitleLines: 1) {
                     // The badge's column is 24 pt: only the badge goes there (#3004); the source tag is under the time (#3043).
-                    if dot { AgentStateBadge(state: session.state, waiting: session.waitsInBackground).padding(.leading, indented ? Theme.Space.l : 0) }
+                    if dot { AgentStateBadge(state: session.state, waiting: session.waitsInBackground, justFinished: session.showsJustFinished(muted: muted)).padding(.leading, indented ? Theme.Space.l : 0) }
                 } trailing: {
                     HStack(alignment: .top, spacing: Theme.Space.s) {
                         VStack(alignment: .trailing, spacing: Theme.Space.xs) {
@@ -4476,8 +4563,8 @@ nonisolated struct SlotRow: View, Equatable {
                             if pendingCount { CountBadge(count: session.pendingInteractions, look: .needs) }
                             #endif
                             if session.state == .needsYou && !muted && !hideState && !pendingCount { BUIPill(session.state.label, tone: .custom(ink: StatusPalette.needsYou.text, fill: StatusPalette.needsYou.tint)) }
-                            if awaitingWord {
-                                let tone = StatusPalette.awaitingReply
+                            if showsReviewWord {
+                                let tone = session.stateTone(muted: muted)
                                 BUIPill(session.stateLabel(muted: muted), tone: .custom(ink: tone.text, fill: tone.tint))
                             }
                             if waitingWord {
@@ -4512,7 +4599,7 @@ nonisolated struct SlotRow: View, Equatable {
                     if dot {
                         HStack(spacing: Theme.Space.s) {
                             if !session.assistant { AgentMark(session) }
-                            StatusDot(state: session.state, size: 9, waiting: session.waitsInBackground)
+                            StatusDot(state: session.state, size: 9, waiting: session.waitsInBackground, justFinished: session.showsJustFinished(muted: muted))
                         }
                         .padding(.top, Theme.Space.xs)
                     }
@@ -4589,7 +4676,9 @@ nonisolated struct SlotRow: View, Equatable {
 
     /// Awaiting Reply spelled out (#5096), as Needs You is: a seen agent's gray dot does not say it waits on the user.
     /// Not for a muted one (it folds with the idle ones), nor where the section already says it.
-    var awaitingWord: Bool { session.awaitsYourReply(muted: muted) && !hideState }
+    var showsReviewWord: Bool {
+        !hideState && (session.awaitsYourReply(muted: muted) || session.showsJustFinished(muted: muted))
+    }
     /// Waiting in the Background spelled out (#6045): its clock alone is a small mark. Not where the section
     /// already says it waits.
     var waitingWord: Bool { session.waitsInBackground && !hideState }
@@ -4603,8 +4692,8 @@ nonisolated struct SlotRow: View, Equatable {
         if session.state == .needsYou && !muted && !hideState && !pendingCount {
             parts.append(Text(session.state.label).fontWeight(.semibold).foregroundStyle(session.state.tone.text))
         }
-        if awaitingWord {
-            parts.append(Text(session.stateLabel(muted: muted)).fontWeight(.semibold).foregroundStyle(StatusPalette.awaitingReply.text))
+        if showsReviewWord {
+            parts.append(Text(session.stateLabel(muted: muted)).fontWeight(.semibold).foregroundStyle(session.stateTone(muted: muted).text))
         }
         if waitingWord { parts.append(Text(session.stateLabel).fontWeight(.semibold).foregroundStyle(StatusPalette.backgroundWaiting.text)) }
         if hasDraft { parts.append(Text("Draft").fontWeight(.semibold).foregroundStyle(Theme.needsYou)) }
@@ -4624,8 +4713,8 @@ nonisolated struct SlotRow: View, Equatable {
     /// Awaiting Reply and Waiting in the Background (`states`), and Draft, spelled out as the rows before did.
     @MainActor private func stateParts(states: Bool) -> [Text] {
         var parts: [Text] = []
-        if states && awaitingWord {
-            parts.append(Text(session.stateLabel(muted: muted)).fontWeight(.semibold).foregroundStyle(StatusPalette.awaitingReply.text))
+        if states && showsReviewWord {
+            parts.append(Text(session.stateLabel(muted: muted)).fontWeight(.semibold).foregroundStyle(session.stateTone(muted: muted).text))
         }
         if states && waitingWord { parts.append(Text(session.stateLabel).fontWeight(.semibold).foregroundStyle(StatusPalette.backgroundWaiting.text)) }
         if hasDraft { parts.append(Text("Draft").fontWeight(.semibold).foregroundStyle(Theme.needsYou)) }
@@ -4770,9 +4859,9 @@ nonisolated struct CompactSlotRow: View, Equatable {
             if !session.assistant { AgentMark(session) }
             Group {
                 if AppStyle.current.usesBeautifulUI {
-                    AgentStateBadge(state: session.state, waiting: session.waitsInBackground).scaleEffect(0.8)
+                    AgentStateBadge(state: session.state, waiting: session.waitsInBackground, justFinished: session.showsJustFinished(muted: muted)).scaleEffect(0.8)
                 } else {
-                    StatusDot(state: session.state, size: Theme.Size.dot, waiting: session.waitsInBackground)
+                    StatusDot(state: session.state, size: Theme.Size.dot, waiting: session.waitsInBackground, justFinished: session.showsJustFinished(muted: muted))
                 }
             }
             .scaledFrame(width: CompactList.mark)
@@ -4799,8 +4888,8 @@ nonisolated struct CompactSlotRow: View, Equatable {
             .animation(UltracodeMark.motion, value: Ultracode.rowMark(session))
             Spacer(minLength: Theme.Space.xs)
             // Awaiting Reply in words (#5096): the dot is a seen agent's gray.
-            if session.awaitsYourReply(muted: muted) && !hideState {
-                Text(session.stateLabel(muted: muted)).font(CompactList.metaStrong).foregroundStyle(StatusPalette.awaitingReply.text).lineLimit(1).fixedSize()
+            if !hideState && (session.awaitsYourReply(muted: muted) || session.showsJustFinished(muted: muted)) {
+                Text(session.stateLabel(muted: muted)).font(CompactList.metaStrong).foregroundStyle(session.stateTone(muted: muted).text).lineLimit(1).fixedSize()
             }
             if muted { ThemedIcon(Theme.Icon.muted).font(CompactList.meta).foregroundStyle(.secondary).accessibilityLabel("Notifications muted") }
             AgentTimeText(time: time, fallback: session.updatedAt, font: CompactList.meta.monospacedDigit())
@@ -4884,6 +4973,21 @@ struct QuietSpaceRow: View {
     }
 }
 
+/// An explicit Agents-tab selection (`AppModel.agentsListReveal`), read in a view of its own: `ChatsView` only acts on it.
+/// Read in the page's body, every choice of the Agents tab ran both tabs' pages again, the Persona conversation and each
+/// of its messages with them (#10303).
+private struct AgentsRevealWatch: View {
+    @Environment(AppModel.self) private var model
+    let reveal: (Int) -> Void
+
+    var body: some View {
+        Color.clear
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: model.agentsListReveal) { _, request in reveal(request) }
+    }
+}
+
 /// The capsules (the BeautifulUI style): a plain list, every row on the page's edges (the grouped list's own top
 /// padding left about 100 pt under the filter chips); otherwise the grouped list.
 /// The Sidebar layout's bookkeeping on the Agents page (#6332): the Persona row is shaded while the page beside the
@@ -4947,7 +5051,7 @@ private struct AgentsListStyle: ViewModifier {
     /// it, the blur did not come); a clear bar gets no blur either, so the page's own color, all but transparent.
     @ViewBuilder private func roomBar(_ list: some View) -> some View {
         #if os(iOS) || os(visionOS)
-        list.safeAreaBar(edge: .top, spacing: 0) {
+        list.safeAreaBarWhenSupported(edge: .top, spacing: 0) {
             if room { AgentsHeader.roomFill.frame(height: Theme.Shell.agentsRoom).allowsHitTesting(false).accessibilityHidden(true) }
         }
         // As under the system's drawer: a hard edge, there only once rows are under the bars (not the field folded
@@ -4972,9 +5076,9 @@ private struct AgentsEdge: ViewModifier {
         if ownsTop {
             content
                 #if os(iOS)
-                .scrollEdgeEffectStyle(room ? .hard : nil, for: .top)
+                .scrollEdgeEffectHardWhenSupported(room, for: .top)
                 #endif
-                .scrollEdgeEffectHidden(!header.rowsUnder, for: .top)
+                .scrollEdgeEffectHiddenWhenSupported(!header.rowsUnder, for: .top)
         } else {
             content
         }
@@ -5066,7 +5170,7 @@ struct SpaceMenuItems: View {
         if let open {
             Button(action: open) { Label("Open Space", systemImage: Theme.Icon.openSpace) }
         }
-        let unread = group.sessions.filter { $0.state == .unread }.map(\.key)
+        let unread = group.sessions.filter { $0.needsSeen(muted: model.isMuted($0)) }.map(\.key)
         if !unread.isEmpty {
             Button { model.markSeen(unread) } label: { Label(StateName.markAllSeen(unread.count), systemImage: Theme.Icon.success) }
         }
@@ -5204,6 +5308,7 @@ private struct AgentsDestinations: ViewModifier {
 private struct AgentsTop: ViewModifier {
     var ownsTop: Bool
     let searchClose: SearchCloseWatcher
+    var retainsQuery: Bool
     #if os(iOS) || os(visionOS)
     @Environment(AgentsHeader.self) private var header
     #endif
@@ -5213,6 +5318,12 @@ private struct AgentsTop: ViewModifier {
         if ownsTop {
             content
                 .background { AgentsHeaderProbe(header: header) }
+                .onChange(of: retainsQuery, initial: true) { wasRetained, retained in
+                    header.retainsQuery = retained
+                    // A retained drag never settles. Clearing it must finish the ordinary empty-field settle even when
+                    // the finger already lifted and no further scroll-phase callback is coming.
+                    if wasRetained, !retained, !header.floating { DispatchQueue.main.async { header.settle() } }
+                }
                 .onAppear { header.foldOnce() } // the search field starts folded away; a pull shows it
                 // Back in front (its tab picked again, the shell's Agents): folded again too (#740). Not on the way
                 // back from a chat, which keeps the list as it was: that changes the view's appearance, not the tab.
@@ -5248,7 +5359,8 @@ private struct AgentsTop: ViewModifier {
 /// P5): the shell's other page in front, another tab, a page pushed over it. `AgentsList`'s body read the app's tab, the
 /// strip's `moving` and the chat on screen for this, each of which changes on a switch between Assistant and Agents, and so
 /// ran three or four times per switch, over every row (#5438). The list holds its feed while covered, the herdr and
-/// worktree polls stop, and a chat coming on screen closes the workspace opened beside the list.
+/// worktree polls stop, the chats not open are no longer warmed (#10582), and a chat coming on screen closes the
+/// workspace opened beside the list.
 private struct AgentsCoverWatch: View {
     @Environment(AppModel.self) private var model
     @Environment(\.shell) private var shell
@@ -5280,14 +5392,26 @@ private struct AgentsCoverWatch: View {
         return false
     }
 
+    /// Whether the Agents' chats not open are warmed for a tap in this list (`AgentSync.warmWhileInSight`, #10582): in
+    /// sight, and beside the page not folded away (the iPad's column, which `isCovered` leaves to the list's own polls).
+    private func warms(covered: Bool) -> Bool {
+        #if os(iOS)
+        if split?.listHidden == true && split?.drawer != true { return false }
+        #endif
+        return !covered
+    }
+
     var body: some View {
         let isCovered = isCovered
+        let warms = warms(covered: isCovered)
         Color.clear
             .allowsHitTesting(false)
             .accessibilityHidden(true)
             // Whether each machine's herdr runs, and the worktrees, while the list is in sight.
             .modifier(HerdrPolling(watch: herdr, key: herdrKey, covered: isCovered))
             .modifier(WorkspaceCatalogPolling(catalog: catalog, enabled: catalogEnabled, covered: isCovered))
+            // The chats a tap here opens are kept current while the list is in sight, its tab in front, the app active.
+            .tabActiveTask(id: warms) { if warms { await AgentSync.shared.warmWhileInSight() } }
             .onChange(of: isCovered, initial: true) { _, now in
                 covered(now)
                 // Out of sight, the hub's lists read for hints once a window; in sight, as they come.
@@ -5648,7 +5772,7 @@ struct AgentsTopBar: View, Equatable {
 enum AgentsNeedsYou {
     static func cards(_ all: [Interaction], session: (SessionKey) -> Session?, machine: String = "", hub: String? = nil) -> [Interaction] {
         all.filter { ix in
-            session(ix.sessionKey)?.assistant != true && (machine.isEmpty || ix.machineRef.path == machine)
+            session(ix.sessionKey)?.assistant != true && session(ix.sessionKey)?.hiddenByDirectory != true && (machine.isEmpty || ix.machineRef.path == machine)
                 && (hub.map { HubFilter.matches($0, ix.group) } ?? true)
         }
     }
@@ -5658,9 +5782,9 @@ enum AgentsNeedsYou {
 /// The Separate layout's tabs at regular width (#8596): the system's tab bar floats across the top, and the split already
 /// makes its room in its columns (64 pt on an iPad). The tab's own top safe area held that room a second time for a tab
 /// first shown after a switch, until UIKit let it go: it did for the Persona tab within a moment, never for the Agents
-/// tab, whose column head sat 64 pt lower. This takes the part of the tab's top safe area beyond the window's own (the
-/// status bar's) back off the tab's hosting controller, so the room is made once, by the split, on both tabs; where UIKit
-/// let it go already there is nothing to take off.
+/// tab, whose column head sat 64 pt lower. This takes the part of the tab's top safe area beyond the window root's own
+/// (the status bar's, and the room the return-to-call bar takes there, #9290) back off the tab's hosting controller, so
+/// the room is made once, by the split, on both tabs; where UIKit let it go already there is nothing to take off.
 private struct TabBarRoomOnce: UIViewRepresentable {
     func makeUIView(context: Context) -> Reader {
         let v = Reader()
@@ -5696,9 +5820,11 @@ private struct TabBarRoomOnce: UIViewRepresentable {
                 .compactMap({ $0 as? UISplitViewController }).first,
                   let tab = split.parent, tab.parent is UITabBarController else { return }
             self.tab = tab
-            // The top the tab's controller is given before this one's own change, against the window's own top.
+            // The top the tab's controller is given before this one's own change, against the window root's top: the
+            // window's own, and the call bar's room the root adds (`CallBarRoom`), which every page keeps.
             let given = tab.view.safeAreaInsets.top - tab.additionalSafeAreaInsets.top
-            let extra = max(0, given - window.safeAreaInsets.top)
+            let rootTop = window.safeAreaInsets.top + (window.rootViewController?.additionalSafeAreaInsets.top ?? 0)
+            let extra = TabBarExtraRoom.extra(given: given, rootTop: rootTop)
             if abs(tab.additionalSafeAreaInsets.top + extra) > 0.5 { tab.additionalSafeAreaInsets.top = -extra }
         }
 
@@ -5706,5 +5832,11 @@ private struct TabBarRoomOnce: UIViewRepresentable {
             if let tab, tab.additionalSafeAreaInsets.top != 0 { tab.additionalSafeAreaInsets.top = 0 }
         }
     }
+}
+
+/// The tab bar's second room (`TabBarRoomOnce`): what a tab's controller is given at the top beyond the window root's
+/// top (the status bar, and the return-to-call bar's room the root adds: never taken back, #9290).
+nonisolated enum TabBarExtraRoom {
+    static func extra(given: CGFloat, rootTop: CGFloat) -> CGFloat { max(0, given - rootTop) }
 }
 #endif

@@ -49,8 +49,8 @@ func TestDigestWait(t *testing.T) {
 		{"first", time.Time{}, []superviseSignal{review}, superviseGather, true},
 		{"gathered", time.Time{}, []superviseSignal{{Kind: sigReview, At: now.Add(-time.Minute)}}, 0, true},
 		{"review after a message", now.Add(-time.Minute), []superviseSignal{review}, superviseEvery - time.Minute, true},
-		{"urgent after a message", now.Add(-time.Minute), []superviseSignal{needs}, superviseUrgentEvery - time.Minute, true},
-		{"the soonest of them", now.Add(-time.Minute), []superviseSignal{review, needs}, superviseUrgentEvery - time.Minute, true},
+		{"decision after a message", now.Add(-time.Minute), []superviseSignal{needs}, superviseGather, true},
+		{"the soonest of them", now.Add(-time.Minute), []superviseSignal{review, needs}, superviseGather, true},
 		{"long after", now.Add(-time.Hour), []superviseSignal{review}, superviseGather, true},
 	} {
 		got, ok := digestWait(now, c.last, c.pending, (&Service{}).superviseTimings())
@@ -74,8 +74,8 @@ func TestSuperviseTimingsOnService(t *testing.T) {
 	now := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
 	short := &Service{superviseTimes: shortSuperviseTimings}
 	got, ok := digestWait(now, now, []superviseSignal{{Kind: sigNeedsYou, At: now}}, short.superviseTimings())
-	if !ok || got != shortSuperviseTimings.urgent {
-		t.Fatalf("digestWait with short timings = %v, %v; want %v, true", got, ok, shortSuperviseTimings.urgent)
+	if !ok || got != shortSuperviseTimings.gather {
+		t.Fatalf("digestWait with short timings = %v, %v; want %v, true", got, ok, shortSuperviseTimings.gather)
 	}
 }
 
@@ -233,7 +233,7 @@ func TestSupervisedTaskRound(t *testing.T) {
 	agentTurn(s, f, proto.StatusWorking, "", 0)
 	agentTurn(s, f, proto.StatusDone, "按 A 做完了，PR https://github.com/o/r/pull/901 已合并", 0)
 	waitFor(t, "the review message", func() bool { return len(f.notices()) == 2 })
-	if n := f.notices()[1]; !strings.Contains(n, "hub 判断做完了，等你验收（PR 已合并）") || !strings.Contains(n, "pull/901") {
+	if n := f.notices()[1]; !strings.Contains(n, "待逐项复核，不代表完成（PR 已合并）") || !strings.Contains(n, "pull/901") {
 		t.Fatalf("message:\n%s", n)
 	}
 	if now := todoNow(s, todo.ID); now.DoneAt != nil || now.Supervision.State != reviewPending {
@@ -472,10 +472,11 @@ func TestGoldenSupervise(t *testing.T) {
 		{ID: "todo_5", Title: "迁移数据库", Kind: sigReport, Report: upReportQuestion, Said: "要不要先停写？\n停写约 2 分钟", Step: 2, Steps: 4,
 			Evidence: []string{"https://github.com/o/r/pull/902"}, Machine: "box", Session: "e5f6a7b8"},
 		{ID: "todo_6", Title: "整理文档", Kind: sigReport, Report: upReportProgress, Said: "写完了一半"},
-		// #2570: a start whose tab the computer keeps, one that failed for good, one that started after a retry
+		// #2570: a start whose tab the computer keeps, one that failed for good (its launcher could not start there, with
+		// the others it may retry with, #10365), one that started after a retry
 		{ID: "todo_7", Title: "修崩溃", Kind: sigFailed, Machine: "box", KeptUntil: "10:12", Question: "[oh-my-zsh] Would you like to update? [Y/n]",
 			Screen: "Last login: Mon Nov  9 22:01:13 on ttys004\n[oh-my-zsh] Would you like to update? [Y/n]", RetriesLeft: 3},
-		{ID: "todo_8", Title: "跑基准", Kind: sigFailed, Detail: "新开的终端标签两次都没接住启动命令", Machine: "box"},
+		{ID: "todo_8", Title: "跑基准", Kind: sigFailed, Detail: "终端运行不了「work」", RetryWith: []string{"claude"}, Machine: "box"},
 		{ID: "todo_9", Title: "整理日志", Kind: sigStarted, Detail: "新标签里的 shell 停在一个提问上", Machine: "box"},
 		// #3618: nobody works on it any more: closed after a model error, closed, its computer away
 		{ID: "todo_10", Title: "升级依赖", Kind: sigOrphaned, Orphan: orphanError, Detail: "API Error: 400 prompt is too long", Machine: "box", Session: "c3d4e5f6",
@@ -499,4 +500,40 @@ func TestGoldenSupervise(t *testing.T) {
 		{ID: "todo_7", Title: "清理旧分支", State: "停着", Orphan: orphanClosed},
 		{ID: "todo_8", Title: "跑回归", State: "停着", Orphan: orphanOffline},
 	}}))
+}
+
+func TestStalledTimeExcludesParkedIntervals(t *testing.T) {
+	s, _, task := newSupervisedService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	firstPark := now.Add(-10 * time.Hour)
+	secondPark := now.Add(-5 * time.Hour)
+	_, _, err := s.updateSupervision(ctx, task.ID, func(v *Supervision) bool {
+		v.State, v.ExpectMinutes = reviewParked, 0
+		v.Reviews = []TaskReview{
+			{At: firstPark, Verdict: reviewParked, ParkEndedAt: secondPark.Add(-3 * time.Minute)},
+			{At: secondPark, Verdict: reviewParked},
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _ = s.todoNow(task.ID)
+	s.supervisedWorking(ctx, task)
+	task, _ = s.todoNow(task.ID)
+	v := task.Supervision
+	resumed := v.Reviews[1].ParkEndedAt
+	if resumed.IsZero() || v.parking() != nil {
+		t.Fatalf("did not track the end of the park: %+v", v)
+	}
+	// A later ledger edit must not move the recorded resume time.
+	v.UpdatedAt = resumed.Add(time.Hour)
+	c := proto.Session{MachineID: "box", SessionID: "s1", State: proto.StateWorking, UpdatedAt: firstPark.Add(-2 * time.Minute)}
+	if got := watchSignals(task, []proto.Session{c}, resumed.Add(5*time.Minute)); len(got) != 0 {
+		t.Fatalf("stalled after ten active minutes: %+v", got)
+	}
+	if got := watchSignals(task, []proto.Session{c}, resumed.Add(17*time.Minute)); len(got) != 1 || got[0].Kind != sigStalled || got[0].Minutes != 22 {
+		t.Fatalf("want 22 active minutes, got %+v", got)
+	}
 }

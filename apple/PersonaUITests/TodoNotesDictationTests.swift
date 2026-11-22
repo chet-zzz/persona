@@ -14,7 +14,8 @@ final class TodoNotesDictationTests: XCTestCase {
         continueAfterFailure = false
         app = XCUIApplication()
         let pair = "persona://pair?url=" + hub.addingPercentEncoding(withAllowedCharacters: .alphanumerics)! + "&token=mock"
-        app.launchArguments = ["-pairURL", pair, "-tab", "assistant", "-openShellPage", "todos"]
+        // The list opens the full form with notes. A saved calendar view opens quick add instead.
+        app.launchArguments = ["-pairURL", pair, "-tab", "assistant", "-openShellPage", "todos", "-todos.view", "list"]
         app.launchPinned()
 
         let add = app.buttons["新建待办"]
@@ -25,7 +26,7 @@ final class TodoNotesDictationTests: XCTestCase {
         XCTAssertTrue(newMic.isHittable)
         XCTAssertEqual(newMic.label, "听写")
         shot("todo-new-notes-mic")
-        app.buttons["取消"].tap()
+        app.buttons["sheet-close"].firstMatch.tap()
         XCTAssertTrue(newMic.waitForNonExistence(timeout: 10))
 
         // The detail, as the screenshots open it (`-openTodoTitled`).

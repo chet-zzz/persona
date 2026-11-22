@@ -209,6 +209,22 @@ func TestNewAgentWithTheDesktopLauncherStartsTheSessionInTheApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstMessageReceived := func() bool {
+		in := app.inbox(s.SessionID)
+		return in != nil && len(in.users()) == 1
+	}
+	// The inbox records the user before send finishes confirming delivery. Drain that send before fixture cleanup
+	// restores peerConfirmWait or closes its background-created inbox, even when an assertion below fails.
+	defer func() {
+		waitFor(t, "the first message in the session's inbox", firstMessageReceived)
+		waitFor(t, "the desktop session's first send to finish", func() bool {
+			unlock, ok := n.typing.tryLock(s.SessionID)
+			if ok {
+				unlock()
+			}
+			return ok
+		})
+	}()
 	if !validID(s.SessionID) || s.Cwd != dir || s.Title != "整理 本周的" || s.SourceKind != proto.SourceClaudeDesktop || s.Launcher != "" {
 		t.Fatalf("session: %+v", s)
 	}
@@ -219,10 +235,7 @@ func TestNewAgentWithTheDesktopLauncherStartsTheSessionInTheApp(t *testing.T) {
 	if links := app.opened(); len(links) == 0 || links[0] != "claude://resume?session="+s.SessionID {
 		t.Fatalf("links: %v", links)
 	}
-	waitFor(t, "the first message in the session's inbox", func() bool {
-		in := app.inbox(s.SessionID)
-		return in != nil && len(in.users()) == 1
-	})
+	waitFor(t, "the first message in the session's inbox", firstMessageReceived)
 	users := app.inbox(s.SessionID).users()
 	if content, _ := users[0]["message"].(map[string]any)["content"].(string); !strings.Contains(content, "整理  本周的\n周报") {
 		t.Fatalf("first message: %v", users[0])
@@ -319,7 +332,7 @@ func TestTheDesktopLauncherIsOfferedWhereTheAppKeepsSessions(t *testing.T) {
 		t.Fatal("not known")
 	}
 	models, err := n.launcherModels(context.Background(), "claude-desktop", "", false)
-	if err != nil || models.Agent != "claude" || len(models.Models) != 0 || models.Locked == "" {
+	if err != nil || models.Agent != "claude" || len(models.Models) != 0 || models.Locked != "" {
 		t.Fatalf("models %+v, %v", models, err)
 	}
 	if c := n.launcherCheck(context.Background(), "claude-desktop"); c.Error != desktopCheckMsg {

@@ -211,8 +211,13 @@ var (
 	nodeUnconfirmed = &rpc.Error{Code: "peer_unconfirmed", Message: "the session has not taken the message yet",
 		Data: json.RawMessage(`{"delivered":"unknown"}`)}
 	nodeTypingFailed = &rpc.Error{Message: "the pane closed while typing", Data: json.RawMessage(`{"delivered":"unknown"}`)}
+	relayedDeadline  = &rpc.Error{Message: context.DeadlineExceeded.Error()} // the bus only carries the words
+	nodeAfterWrite   = &rpc.Error{Code: "internal", Message: "could not save the receipt", Data: json.RawMessage(`{"delivered":"yes"}`)}
 	nodeRefused      = &rpc.Error{Code: "not_delivered", Message: "the terminal took nothing", Data: json.RawMessage(`{"delivered":"none"}`)}
 )
+
+// The node acknowledged its write but returned a receipt of the wrong shape.
+func unreadableWriteReceipt(string, json.RawMessage) (any, error) { return 42, nil }
 
 // sessionSends counts the session.send calls f got, answered or not.
 func sessionSends(f *fakeHub) int {
@@ -410,6 +415,9 @@ func TestAnUnknownSendReopensOnTheAgentsNextTurn(t *testing.T) {
 		later    time.Duration // how long after the send the agent's turn starts
 	}{
 		{"agent_send", "no answer", context.DeadlineExceeded, 0},
+		{"agent_send", "deadline across the bus", relayedDeadline, 0},
+		{"agent_send", "node failed after writing", nodeAfterWrite, 0},
+		{"agent_send", "unreadable write receipt", nil, 0},
 		{"card", "no answer", context.DeadlineExceeded, 0},
 		{"agent_send", "no answer", context.DeadlineExceeded, time.Hour},
 		{"card", "no answer", context.DeadlineExceeded, time.Hour},
@@ -429,6 +437,9 @@ func TestAnUnknownSendReopensOnTheAgentsNextTurn(t *testing.T) {
 			s, f, accepted := acceptedPlanTask(t, nil)
 			before := supervisionOf(s, f, accepted.ID)
 			failSends(f, c.err)
+			if c.err == nil {
+				f.answerNode(DeviceSessionSend, unreadableWriteReceipt)
+			}
 			if err := sendVia(t, s, c.via, "conv1", accepted.ID, "Please cover the landscape case too"); err == nil {
 				t.Fatal("the send's answer came")
 			}
@@ -1033,7 +1044,9 @@ func TestACardMessageReopensOnlyItsOwnTask(t *testing.T) {
 		other = todoNow(s, "todo_b")
 	}}
 	f.mu.Unlock()
-	if _, err := s.routeToTask(ctx, "conv1", accepted.ID, "Please cover the landscape case too"); err != nil {
+	// Only the card message's own look at the agents runs the hook: the token sync the acceptance started may still be
+	// listing box.
+	if _, err := s.routeToTask(listHooked(ctx), "conv1", accepted.ID, "Please cover the landscape case too"); err != nil {
 		t.Fatalf("the card message: %v", err)
 	}
 	if other.ID == "" || other.DoneAt == nil || other.DoneBy != db.DoneByReview || !slices.ContainsFunc(other.Agents, func(a TodoAgent) bool {

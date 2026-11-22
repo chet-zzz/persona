@@ -12,13 +12,15 @@ import (
 
 	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/proto"
+	"github.com/nwverse/persona/server/internal/tokenuse"
 )
 
 // Codex rollouts (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl) are a different JSONL: every line is
 // {timestamp, type, payload}. The conversation lives in event_msg/item_completed (UserMessage, AgentMessage,
-// Reasoning, CommandExecution, FileChange, McpToolCall, ImageView, ContextCompaction); response_item lines repeat
-// the same content in the model's wire format and are skipped. They map onto the same items as Claude's transcript,
-// with Claude's tool names (Bash, Edit, Read, mcp__server__tool) so the apps render them alike.
+// Reasoning, CommandExecution, FileChange, McpToolCall, ImageView, Extension, SubAgentActivity, CollabAgentToolCall,
+// ContextCompaction); response_item lines repeat the same content in the model's wire format and are skipped. They map
+// onto the same items as Claude's transcript, with Claude's tool names (Bash, Edit, Read, mcp__server__tool) so the
+// apps render them alike.
 
 type codexLine struct {
 	Timestamp time.Time       `json:"timestamp"`
@@ -45,22 +47,11 @@ type codexPayload struct {
 	} `json:"sandbox_policy"`
 	Effort string `json:"effort"`
 	// event_msg
-	Item   *codexItem      `json:"item"`
-	Goal   json.RawMessage `json:"goal"` // thread_goal_updated (goal.go)
-	Reason string          `json:"reason"`
-	Info   *struct {
-		Total struct {
-			OutputTokens int   `json:"output_tokens"`
-			TotalTokens  int64 `json:"total_tokens"`
-		} `json:"total_token_usage"`
-		Last struct {
-			InputTokens       int   `json:"input_tokens"`
-			CachedInputTokens int64 `json:"cached_input_tokens"`
-			OutputTokens      int64 `json:"output_tokens"`
-		} `json:"last_token_usage"`
-		ModelContextWindow int `json:"model_context_window"`
-	} `json:"info"`
-	RateLimits *codexRateLimits `json:"rate_limits"` // token_count: the account's limits as the last response gave them
+	Item       *codexItem          `json:"item"`
+	Goal       json.RawMessage     `json:"goal"` // thread_goal_updated (goal.go)
+	Reason     string              `json:"reason"`
+	Info       *tokenuse.CodexInfo `json:"info"`        // token_count
+	RateLimits *codexRateLimits    `json:"rate_limits"` // token_count: the account's limits as the last response gave them
 }
 
 // codexRateLimits is a token_count's rate_limits (node/usagewindows.go reads the same for the usage windows).
@@ -147,6 +138,17 @@ type codexItem struct {
 		Domain  string `json:"domain"`
 		Snippet string `json:"snippet"`
 	} `json:"results"`
+	// Extension (kind clock.sleep): how long the agent waited
+	DurationMs *int64 `json:"durationMs"`
+	// SubAgentActivity (kind started, interacted or completed): the subagent, and on start its model and effort
+	AgentThreadID   string  `json:"agent_thread_id"`
+	AgentPath       string  `json:"agent_path"`
+	Model           *string `json:"model"`
+	ReasoningEffort *string `json:"reasoning_effort"`
+	// CollabAgentToolCall (tool wait…): the subagents it was about, and their states when it returned
+	ReceiverThreadIDs []string        `json:"receiver_thread_ids"`
+	ReceiverAgents    json.RawMessage `json:"receiver_agents"`
+	AgentsStates      json.RawMessage `json:"agents_states"`
 }
 
 // isCodexLine tells a rollout line from a Claude transcript line: only rollouts wrap everything in "payload" under a
@@ -280,7 +282,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return nil
 	case "turn_context":
 		if p.Model != "" {
-			meta.Model = p.Model
+			meta.Model, meta.ModelAt = p.Model, l.Timestamp
 		}
 		meta.codexTurnModel = p.Model
 		meta.PermissionMode, meta.CodexSandbox, meta.ModeAt = p.ApprovalPolicy, p.SandboxPolicy.Type, l.Timestamp
@@ -301,12 +303,11 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 	switch p.Type {
 	case "token_count":
 		if p.Info != nil {
-			meta.ContextTokens, meta.OutputTokens = p.Info.Last.InputTokens, p.Info.Total.OutputTokens
+			meta.ContextTokens, meta.OutputTokens = int(p.Info.Last.Input), int(p.Info.Total.Output)
 			if p.Info.ModelContextWindow > 0 {
 				meta.ContextWindow = p.Info.ModelContextWindow
 			}
-			last := p.Info.Last
-			meta.codexRequest(p.Info.Total.TotalTokens, int64(last.InputTokens), last.CachedInputTokens, last.OutputTokens)
+			meta.codexRequest(p.Info.Total.Total, p.Info.Last)
 		}
 		if p.RateLimits != nil { // none: the provider gave none this time, the last ones stand
 			if until, ok := p.RateLimits.fullUntil(); ok {
@@ -324,7 +325,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		meta.codexSeen = nil // an item repeats only within its turn: a long rollout keeps no ids of the turns before
 		return nil
 	case "task_complete":
-		meta.TurnOpen, meta.TurnClosed = false, true
+		meta.endTurn(seq, l.Timestamp)
 		// A turn the model service failed writes no answer: its error is here (Codex 0.166, #2185).
 		meta.clearTurnError()
 		if meta.TurnError, meta.TurnErrorKind = CodexTurnError(p.Error); meta.TurnError != "" {
@@ -346,7 +347,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		it.Usage = usage // the turn's requests, summed (item_usage.go)
 		return []proto.Item{it}
 	case "turn_aborted":
-		meta.TurnOpen, meta.TurnClosed = false, true
+		meta.endTurn(seq, l.Timestamp)
 		meta.clearTurnError() // stopped by the user: no failure
 		meta.turnWorked = false
 		it := mk(0, "", "system", proto.KindNotice)
@@ -355,6 +356,10 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return []proto.Item{it}
 	case "thread_goal_updated":
 		return meta.codexGoalUpdated(p.Goal, l.Timestamp, func() proto.Item { return mk(0, "", "system", proto.KindNotice) })
+	case "context_compacted", "compacted":
+		meta.ContextTokens, meta.ContextCompacted = 0, true
+		meta.ContextStats.ResetCompacted()
+		return nil
 	case "item_completed":
 	default:
 		return nil
@@ -418,14 +423,34 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 		for _, c := range it.Content {
 			switch {
 			case c.Type == "text" && strings.TrimSpace(c.Text) != "":
-				parts = append(parts, codexUserText(c.Text))
+				parts = append(parts, c.Text)
 			case c.Type == "local_image" && c.Path != "":
 				images = append(images, strings.TrimPrefix(c.Path, "file://"))
 			}
 		}
+		// Match the envelope before removing other kinds of input metadata or clipping long prompts.
+		if len(parts) == 1 && len(images) == 0 {
+			if prompt, ok := codexHeartbeatPrompt(strings.TrimSpace(parts[0])); ok {
+				meta.observeUserText(prompt, false)
+				u := mk(0, it.ID, "user", proto.KindText)
+				u.Source = &proto.MessageSource{Kind: proto.SourceScheduledTask}
+				u.Text = clip(prompt)
+				if meta.codexUserID == "" {
+					meta.codexUserID = u.ID
+				}
+				return []proto.Item{u}
+			}
+		}
+		for i := range parts {
+			parts[i] = codexUserText(parts[i])
+		}
 		text := strings.TrimSpace(strings.Join(parts, "\n"))
 		items, paseo := paseoInput(func(n int, role, kind string) proto.Item { return mk(n, it.ID, role, kind) }, 0, text)
 		if paseo && (len(images) == 0 || attachImages(items, images)) {
+			meta.observeUserText(text, false)
+			if len(images) > 0 {
+				meta.ContextStats.ConversationBytes += int64(len(images)) * imageTokenBytesEstimate
+			}
 			if meta.codexUserID == "" && len(items) > 0 { // it started the turn: its notices woke the agent
 				markWake(items)
 				meta.codexUserID = items[0].ID
@@ -435,12 +460,16 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			}
 			return items
 		}
-		text = strings.TrimSpace(text + imagesNote(images))
-		if text == "" {
+		fullText := strings.TrimSpace(text + imagesNote(images))
+		if fullText == "" {
 			return nil
 		}
+		meta.observeUserText(text, false)
+		if len(images) > 0 {
+			meta.ContextStats.ConversationBytes += int64(len(images)) * imageTokenBytesEstimate
+		}
 		u := mk(0, it.ID, "user", proto.KindText)
-		u.Text = clip(text)
+		u.Text = clip(fullText)
 		if meta.codexUserID == "" {
 			meta.codexUserID = u.ID
 		}
@@ -453,8 +482,13 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 		for _, c := range it.Content {
 			b.WriteString(c.Text)
 		}
-		text := codexThreadLinks(strings.TrimSpace(b.String()))
-		if text == "" {
+		text := strings.TrimSpace(b.String())
+		quiet := false
+		if it.Phase == "final_answer" {
+			text, quiet = codexHeartbeatAnswer(text)
+		}
+		text, vizRefs := splitVisualizations(codexThreadLinks(text))
+		if text == "" && len(vizRefs) == 0 {
 			return nil
 		}
 		// AgentMessage is what Codex said, including narration between tool calls; only Reasoning is thinking.
@@ -462,15 +496,28 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			meta.LastText = t
 			meta.turnSaid(t)
 		}
-		a := mk(0, it.ID, "assistant", proto.KindText)
-		a.Narration = it.Phase == "commentary"
-		a.Text = clip(text)
-		return []proto.Item{a}
+		var out []proto.Item
+		if text != "" {
+			meta.ContextStats.ConversationBytes += estimateWeightedBytes(text)
+			a := mk(0, it.ID, "assistant", proto.KindText)
+			a.Narration = it.Phase == "commentary"
+			a.CodexHeartbeatQuiet = quiet
+			a.Text = clip(text)
+			out = append(out, a)
+		}
+		for _, ref := range vizRefs {
+			v := mk(len(out), it.ID, "assistant", proto.KindVisualization)
+			v.Narration = it.Phase == "commentary"
+			v.Visualization = &proto.Visualization{Path: ref.Path, Mode: ref.Mode, Title: ref.Title}
+			out = append(out, v)
+		}
+		return out
 	case "Reasoning":
 		text := strings.TrimSpace(strings.Join(it.SummaryText, "\n\n"))
 		if text == "" {
 			return nil
 		}
+		meta.ContextStats.ConversationBytes += estimateWeightedBytes(text)
 		t := mk(0, it.ID, "assistant", proto.KindThinking)
 		t.Text = clip(text)
 		return []proto.Item{t}
@@ -491,11 +538,13 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 				diff = ch.Content
 			}
 			input, _ := json.Marshal(map[string]string{"file_path": path, "diff": diff, "change": ch.Type})
+			resText := ch.Type + " " + path
+			meta.observeToolContext("Edit", input, resText)
 			id := fmt.Sprintf("%s-%d", it.ID, n)
 			use := mk(2*n, id, "assistant", proto.KindToolUse)
 			use.ToolUseID, use.ToolName, use.ToolInput = id, "Edit", clipJSON(input) // a new file's whole content
 			res := mk(2*n+1, id, "user", proto.KindToolResult)
-			res.ToolUseID, res.Text, res.IsError = id, ch.Type+" "+path, it.Status == "failed"
+			res.ToolUseID, res.Text, res.IsError = id, resText, it.Status == "failed"
 			res.Outcome = &proto.ToolOutcome{Status: codexStatus(it.Status, res.IsError)}
 			out = append(out, use, res)
 			n++
@@ -523,8 +572,11 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 		if len(parts) == 0 && isErr && len(it.Error) > 0 {
 			parts = append(parts, string(it.Error))
 		}
-		items := codexTool(mk, it.ID, "mcp__"+it.Server+"__"+it.Tool, args, strings.Join(parts, "\n"), isErr)
+		items := codexTool(meta, mk, it.ID, "mcp__"+it.Server+"__"+it.Tool, args, strings.Join(parts, "\n"), isErr)
 		items[1].Outcome.Status = codexStatus(it.Status, isErr)
+		if len(images) > 0 {
+			meta.ContextStats.ToolOutputBytes += int64(len(images)) * imageTokenBytesEstimate
+		}
 		for j, img := range images { // after the result, on the call's card, as a Claude tool result's pictures are
 			im := mk(2+j, it.ID, "user", proto.KindImage)
 			im.ToolUseID, im.Image = it.ID, img
@@ -533,16 +585,25 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 		return items
 	case "ImageView":
 		input, _ := json.Marshal(map[string]string{"file_path": strings.TrimPrefix(it.Path, "file://")})
-		return codexTool(mk, it.ID, "Read", input, "", false)
+		return codexTool(meta, mk, it.ID, "Read", input, "", false)
 	case "Extension":
-		if it.Kind != "web.search" {
-			n := mk(0, it.ID, "system", proto.KindNotice)
-			n.Text = "Codex 扩展事件：" + it.Kind + "（完整记录在原会话中）"
-			return []proto.Item{n}
+		switch it.Kind {
+		case "web.search":
+			return codexWebSearch(meta, mk, it)
+		case "clock.sleep":
+			return codexSleep(meta, mk, it)
 		}
-		return codexWebSearch(mk, it)
+		n := mk(0, it.ID, "system", proto.KindNotice)
+		n.Text = "Codex 扩展事件：" + it.Kind + "（完整记录在原会话中）"
+		return []proto.Item{n}
+	case "SubAgentActivity":
+		return codexSubagentActivity(meta, mk, it)
+	case "CollabAgentToolCall":
+		return codexCollabCall(meta, mk, it)
 	case "ContextCompaction":
 		meta.Compactions++
+		meta.ContextTokens, meta.ContextCompacted = 0, true
+		meta.ContextStats.ResetCompacted()
 		n := mk(0, it.ID, "system", proto.KindNotice)
 		n.Text = CompactedNotice
 		return []proto.Item{n}
@@ -622,6 +683,7 @@ func codexCommandLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto
 			}
 			meta.codexPendingAdd(it.ID)
 		}
+		meta.observeToolContext("Bash", input, "")
 		use := mk(0, it.ID, "assistant", proto.KindToolUse)
 		use.ToolUseID, use.ToolName, use.ToolInput = it.ID, "Bash", clipJSON(input)
 		return []proto.Item{use}
@@ -636,6 +698,7 @@ func codexCommandLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto
 	}
 	if it.ID != "" && meta.codexPendingDone(it.ID) {
 		// The terminal record of a backgrounded call: only its result, under the call already shown.
+		meta.ContextStats.ToolOutputBytes += estimateWeightedBytes(out)
 		res := mk(1, it.ID, "user", proto.KindToolResult)
 		res.ToolUseID, res.Text, res.IsError = it.ID, clip(out), failed
 		res.Outcome = &proto.ToolOutcome{Status: codexStatus(it.Status, failed), ExitCode: it.ExitCode, DurationMS: it.Duration.ms, Tail: outputTail(out)}
@@ -648,7 +711,7 @@ func codexCommandLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto
 		}
 		meta.codexSeenAdd(it.ID)
 	}
-	items := codexTool(mk, it.ID, "Bash", input, out, failed)
+	items := codexTool(meta, mk, it.ID, "Bash", input, out, failed)
 	o := items[1].Outcome
 	o.Status, o.ExitCode, o.DurationMS = codexStatus(it.Status, failed), it.ExitCode, it.Duration.ms
 	return items
@@ -701,6 +764,7 @@ func attachImages(items []proto.Item, images []string) bool {
 // codexUserText cleans what Codex records as the user's message: ambient context (and Persona's) goes, and the answer to a question
 // Codex asked (request_user_input, stored as JSON) reads as the answer itself ("question: answer", with a full-width colon, when several).
 func codexUserText(s string) string {
+	s = StripInterject(s)
 	s = legacyLarkAgent(strings.TrimSpace(ContextRe.ReplaceAllString(dropTagged(ViewErrorsRe, "<persona-view-errors", codexAmbientRe.ReplaceAllString(s, "")), "")))
 	return strings.TrimSpace(CodexReplyRe.ReplaceAllStringFunc(s, func(block string) string {
 		var replies []struct {
@@ -724,7 +788,7 @@ func codexUserText(s string) string {
 
 // codexWebSearch shows a web search (or a page it opened) the way Claude's WebSearch / WebFetch calls look: the query or
 // URL as input, the results as one "title  url" line each.
-func codexWebSearch(mk func(int, string, string, string) proto.Item, it *codexItem) []proto.Item {
+func codexWebSearch(meta *Meta, mk func(int, string, string, string) proto.Item, it *codexItem) []proto.Item {
 	name, input := "WebSearch", map[string]string{"query": it.Query}
 	if a := it.Action; a != nil {
 		switch {
@@ -746,13 +810,99 @@ func codexWebSearch(mk func(int, string, string, string) proto.Item, it *codexIt
 		}
 	}
 	raw, _ := json.Marshal(input)
-	return codexTool(mk, it.ID, name, raw, strings.Join(lines, "\n"), false)
+	return codexTool(meta, mk, it.ID, name, raw, strings.Join(lines, "\n"), false)
+}
+
+// codexSleep shows the agent waiting (Codex's clock.sleep, a coordinator's pause while its subagents work) as a call of
+// its own: work that folds with the calls around it, and a run of sleeps folds into one row.
+func codexSleep(meta *Meta, mk func(int, string, string, string) proto.Item, it *codexItem) []proto.Item {
+	input := map[string]any{}
+	if ms := it.DurationMs; ms != nil && *ms >= 0 {
+		input["duration"], input["duration_ms"] = sleepDuration(*ms), *ms
+	}
+	raw, _ := json.Marshal(input)
+	return codexTool(meta, mk, it.ID, "sleep", raw, "", false)
+}
+
+// sleepDuration is a wait as people read it: 25s, 1m30s, 2m.
+func sleepDuration(ms int64) string {
+	s := (time.Duration(ms) * time.Millisecond).String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
+}
+
+// codexSubagentActivity shows a subagent started, messaged or finished (SubAgentActivity) as a call named by the
+// subagent's task; started also carries the model and effort Codex gave it.
+func codexSubagentActivity(meta *Meta, mk func(int, string, string, string) proto.Item, it *codexItem) []proto.Item {
+	name := it.AgentThreadID
+	if p := strings.TrimRight(it.AgentPath, "/"); p != "" {
+		name = p[strings.LastIndex(p, "/")+1:]
+	}
+	raw, _ := json.Marshal(struct {
+		Name            string `json:"name,omitempty"`
+		Event           string `json:"event,omitempty"`
+		AgentPath       string `json:"agent_path,omitempty"`
+		AgentThreadID   string `json:"agent_thread_id,omitempty"`
+		Model           string `json:"model,omitempty"`
+		ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	}{name, it.Kind, it.AgentPath, it.AgentThreadID, derefString(it.Model), derefString(it.ReasoningEffort)})
+	return codexTool(meta, mk, it.ID, "subagent", raw, "", false)
+}
+
+// codexCollabCall shows a call that coordinates subagents (CollabAgentToolCall): wait is Codex's wait_agent, the
+// subagents it names are its input and their states when it returned its result.
+func codexCollabCall(meta *Meta, mk func(int, string, string, string) proto.Item, it *codexItem) []proto.Item {
+	name := it.Tool
+	switch name {
+	case "":
+		name = "collab_agent"
+	case "wait":
+		name = "wait_agent"
+	}
+	input := map[string]any{}
+	if len(it.ReceiverThreadIDs) > 0 {
+		input["receiver_thread_ids"] = it.ReceiverThreadIDs
+	}
+	if jsonNonEmpty(it.ReceiverAgents) {
+		input["receiver_agents"] = it.ReceiverAgents
+	}
+	raw, _ := json.Marshal(input)
+	result := ""
+	if jsonNonEmpty(it.AgentsStates) {
+		result = string(it.AgentsStates)
+	}
+	failed := it.Status == "failed"
+	items := codexTool(meta, mk, it.ID, name, raw, result, failed)
+	items[1].Outcome.Status = codexStatus(it.Status, failed)
+	return items
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// jsonNonEmpty is false for a missing, null, empty array or empty object value.
+func jsonNonEmpty(raw json.RawMessage) bool {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", "[]", "{}":
+		return false
+	}
+	return true
 }
 
 // codexTool is a finished tool call: Codex writes the call and its result in one line. Its input is clipped as a
 // Claude tool_use's is (a heredoc command, an MCP call's long argument would go out whole in every page and push). Its
 // outcome says ok or failed and has the output's tail; callers that know more (a status, an exit code) add it.
-func codexTool(mk func(int, string, string, string) proto.Item, id, name string, input json.RawMessage, result string, isErr bool) []proto.Item {
+func codexTool(meta *Meta, mk func(int, string, string, string) proto.Item, id, name string, input json.RawMessage, result string, isErr bool) []proto.Item {
+	meta.observeToolContext(name, input, result)
 	use := mk(0, id, "assistant", proto.KindToolUse)
 	use.ToolUseID, use.ToolName, use.ToolInput = id, name, clipJSON(input)
 	res := mk(1, id, "user", proto.KindToolResult)

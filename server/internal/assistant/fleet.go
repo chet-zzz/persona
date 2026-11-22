@@ -63,6 +63,9 @@ type fleetBook struct {
 	// never reads what this one writes (#4554).
 	upgradeEvery, upgradeFor time.Duration
 	upgrades                 sync.WaitGroup // active screen-upgrade loops; database-backed fixtures wait during teardown
+	completionRuns           sync.WaitGroup // delayed turn completions already running when a fixture tears down
+	completionTimers         map[*time.Timer]struct{}
+	completionStopped        bool // test teardown only: no new delayed completion after the drain starts
 	// hooked: Persona's hooks run in the session (a hook event came since the manager started).
 	hooked map[[2]string]bool
 	// stopSig: the signature of the reply each session's latest Stop ended its turn with; pushedSig: the one a
@@ -71,6 +74,11 @@ type fleetBook struct {
 	turns              *turnTracker // "machine/session" -> the turn in progress, for the finished push
 	clients            assistantwire.Clients
 	prev               map[string]map[string]turnPrev // each machine's list setSessions saw last, by session id
+	// prevConn: the node connection (devices' ConnectedAt) each machine's prev list came on.
+	// heldRows: the last listed row of each Agent with a held message, by machine and session. These display-only
+	// copies recreate a missing row; the devices' inventory stays authoritative for delivery.
+	heldRows map[string]map[string]proto.Session
+	prevConn map[string]time.Time
 
 	// sent: what is kept of each machine's last session list told the hub (fleet.sessions): its length and digest, not
 	// its bytes. sentMu is held while a list is decorated, encoded into enc and told (publishList), so the lists reach
@@ -84,6 +92,9 @@ type fleetBook struct {
 	// agents awaiting a reply read them instead of decorating every list each minute, agents_reply.go).
 	shownMu sync.Mutex
 	shown   map[string][]proto.Session
+	// finishedDue: when the first Just finished row of each machine's list, as last decorated to be told, runs out
+	// of its window (#9751), under shownMu. Nothing else tells a list again when only time passes (republishFinished).
+	finishedDue map[string]time.Time
 	// asks: what each session's last words ask, while they stay the same (fleet_asks.go).
 	asks asksMemo
 	// folds: what each machine's last complete list folded its children under (fleet_fold.go), for the rows and
@@ -332,12 +343,19 @@ var rateLimited = lazyre.New(`(?i)\b429\b|rate[ _-]?limit|too many requests|usag
 // turnErrorCode is what a turn's model API error says is wrong, for a card that says what to fix (Session.TurnErrorCode,
 // docs/assistant/onboarding.md 5.2); "" when it does not say.
 func turnErrorCode(text string) string {
+	if code := proto.UnrecoverableTurnErrorCode(text); code != "" {
+		return code
+	}
 	t := strings.TrimSpace(text)
 	switch {
 	case strings.HasPrefix(strings.ToLower(t), "not logged in"):
 		return proto.TurnErrorNotLoggedIn
 	case strings.Contains(t, "There's an issue with the selected model"):
 		return proto.TurnErrorModelRoute
+	case assistantwire.ToolSearchRefused(t):
+		// Before the classes below: a gateway's words for it may say "not supported" next to "model". The node resent
+		// the turn once with every tool loaded and starts the conversation that way from now on (#10365).
+		return proto.TurnErrorToolSearchUnsupported
 	}
 	switch classifyLauncherError(t) { // the launcher health checks' classes (launcher_health.go)
 	case errKindUsageLimit:
@@ -362,6 +380,9 @@ func sessionTurnErrorCode(c proto.Session) string {
 		return ""
 	}
 	code := turnErrorCode(c.TurnError)
+	if proto.UnrecoverableTurnErrorCode(c.TurnError) != "" {
+		return code
+	}
 	if c.TurnErrorKind == proto.TurnErrorUsageLimit {
 		return proto.TurnErrorRateLimited
 	}

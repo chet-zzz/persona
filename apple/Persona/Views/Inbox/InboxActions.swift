@@ -147,7 +147,7 @@ struct InboxDraftSheet: View {
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                SheetClose { dismiss() }
                 ToolbarItem(placement: .confirmationAction) {
                     Button { Task { await send() } } label: {
                         Text("Send").lineLimit(1)
@@ -399,7 +399,7 @@ struct InboxHandOffSheet: View {
             .navigationTitle("Hand to AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                SheetClose { dismiss() }
                 ToolbarItem(placement: .confirmationAction) {
                     Button { Task { await send() } } label: {
                         if handOff.sending { ProgressView() } else { Text("Send").lineLimit(1) }
@@ -493,7 +493,7 @@ struct InboxHandOffSheet: View {
         }
         if let c = it.connector, let url = c.url { text += "\n\n（\(it.accountName)：\(url)）" } // i18n-ignore: context for the agent
         if let m = it.mail, let uid = m.uids.last {
-            text += "\n\n（邮件 account_id \(m.accountID)，mailbox \(m.mailbox)，uid \(uid)，可用 mail_read 读全文、mail_send 回复）" // i18n-ignore
+            text += "\n\n（邮件 account_id \(m.accountID)，mailbox \(m.sourceMailbox ?? "INBOX")，uid \(uid)，可用 mail_read 读全文、mail_send 回复）" // i18n-ignore
         }
         return ContextRef(kind: "context", title: title, url: "", text: text)
     }

@@ -5,7 +5,7 @@ import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
 import type { PluggableList } from "unified";
 import { clickLink, linkHref, linkRoute, prefetchLink } from "../lib/links";
 import { fileDownloadURL } from "../lib/api";
-import { isMachineRef, resolveRef } from "../lib/files";
+import { isMachineRef, isWindowsDrivePath, linkLine, resolveRef } from "../lib/files";
 import { useLinkManager } from "../lib/manager-choice";
 import { openPanel } from "../lib/panel";
 import remarkMath from "remark-math";
@@ -16,7 +16,7 @@ import { Icon } from "./icons";
 import { MermaidBlock } from "./Mermaid";
 import { ExternalImage } from "./ExternalImage";
 import { ReplyPicturesContext } from "./reply-pictures-context";
-import { ReplyImagesRun, useReplyImages } from "./reply-images-lazy";
+import { LocalImageRun, ReplyImagesRun, useReplyImages } from "./reply-images-lazy";
 import { AssistantCard, CARD_LANGUAGES } from "./AssistantCard";
 import { rehypePathLinks, textPaths, writtenText } from "./PathLinks";
 import { usePathLinks } from "../lib/path-presence";
@@ -54,8 +54,11 @@ export function trimURL(url: string): string {
 // end of its quote or list item, or of the text while streaming), indented code (4 spaces after a blank line, outside
 // lists) and code spans (a run of n backticks up to the next run of n). Returns text and code alternately, so odd
 // indices are code: left alone by normalizeMath and linkify.
-const QUOTES = /^(?:[ \t]*>[ \t]?)*/;
-const FENCE = /^((?:[ \t]*>[ \t]?)*)([ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?[ \t]*)(`{3,}|~{3,})/;
+// Quote markers are each taken with the spaces before them, then one space after the last. Written as
+// (?:[ \t]*>[ \t]?)*, a space between two markers fits either way, and a deeply quoted line that is no fence tried every
+// split before failing (24 markers took half a second, each one more doubled it; #9795).
+const QUOTES = /^(?:[ \t]*>)*(?:(?<=>)[ \t])?/;
+const FENCE = /^((?:[ \t]*>)*(?:(?<=>)[ \t])?)([ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?[ \t]*)(`{3,}|~{3,})/;
 const LIST_ITEM = /^(?:[ \t]*>)*[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]/;
 const INDENTED = /^( {4}|\t)/;
 
@@ -148,7 +151,7 @@ export function splitCode(md: string): string[] {
 
 // What starts a line inside a quote or list item, and what a new line needs to stay in it: quote markers are kept,
 // a list marker becomes spaces.
-const PREFIX = /^(?:[ \t]*>[ \t]?)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?/;
+const PREFIX = /^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?/;
 const continuation = (prefix: string) => prefix.replace(/[-*+]|\d{1,9}[.)]/, (m) => " ".repeat(m.length));
 
 // Bare URLs and <autolinks>: a $ in them (https://…/odata/$metadata) is part of the address, not math.
@@ -186,7 +189,7 @@ export function normalizeMath(md: string): string {
         return u.includes("$") ? `${pre}${hold(u, true)}${url.slice(u.length)}` : m;
       })
       .replace(
-        /^((?:[ \t]*>[ \t]?)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\$\$([^$\n]+)\$\$[ \t]*$/gm,
+        /^((?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\$\$([^$\n]+)\$\$[ \t]*$/gm, // quote markers as in QUOTES
         (m, pre: string, tex: string, off: number) =>
           off === 0 && midLine ? m : `${pre}$$\n${continuation(pre)}${tex.trim()}\n${continuation(pre)}$$`,
       )
@@ -331,18 +334,22 @@ export function linkify(md: string, { math = false }: { math?: boolean } = {}): 
     .join("");
 }
 
-// persona://session links survive (they move to that conversation); everything else as react-markdown decides
-// (javascript: and other apps' schemes are dropped).
+// App links to a page of Persona's survive (persona://open<path>, persona://session|task|kb…: they open that page,
+// docs/protocol/deep-links.md), and Windows drive paths (`C:\…` / `C:/…`) are preserved for local machine files;
+// everything else as react-markdown decides (javascript:, file:, data: and other apps' schemes are dropped).
 export function markdownUrl(url: string): string {
-  return linkRoute(url).kind === "session" ? url : defaultUrlTransform(url);
+  if (isWindowsDrivePath(url)) return url;
+  const kind = linkRoute(url).kind;
+  return kind === "session" || kind === "app" ? url : defaultUrlTransform(url);
 }
 
 // A link opens where it belongs (lib/links.ts): Feishu documents in the side panel (read as the chat's manager),
 // conversations in place, pages in a new tab. ⌘ / Ctrl / middle click is always the browser's new tab.
-// `line`: a path a message names at a line (src/a.ts:12, PathLinks.tsx) opens there.
+// `line`: a path a message names at a line (src/a.ts:12, PathLinks.tsx, or `#L12` in a Markdown link) opens there.
 function Link({ href, children, mid, cwd, line, title: hover }: { href?: string; children?: React.ReactNode; mid?: string; cwd?: string; line?: number; title?: string }) {
   const title = textOf(children).trim();
   const path = mid && href && isMachineRef(href) ? resolveRef(cwd ?? "", href) : "";
+  const targetLine = line ?? (path && href ? linkLine(href) : undefined);
   const manager = useLinkManager();
   return (
     <a
@@ -353,7 +360,7 @@ function Link({ href, children, mid, cwd, line, title: hover }: { href?: string;
       onClick={(e) => {
         if (path && mid && !e.defaultPrevented && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
           e.preventDefault();
-          openPanel({ kind: "file", mid, path, cwd, line });
+          openPanel({ kind: "file", mid, path, cwd, line: targetLine });
         } else clickLink(e, href, title && title !== href ? title : undefined, manager);
       }}
       onPointerEnter={() => prefetchLink(href, manager)}
@@ -553,6 +560,17 @@ function componentsFor(mid: string, cwd: string | undefined): Components {
         const title = typeof node?.properties?.title === "string" ? node.properties.title : undefined;
         return <Link href={href} mid={mid} cwd={cwd} line={line} title={title}>{children}</Link>;
       },
+      img: (props) => {
+        const src = typeof props.src === "string" ? props.src : "";
+        if (isMachineRef(src)) {
+          return (
+            <Suspense fallback={null}>
+              <LocalImageRun mid={mid} cwd={cwd} src={src} alt={typeof props.alt === "string" ? props.alt : ""} />
+            </Suspense>
+          );
+        }
+        return <ExternalImage {...props} />;
+      },
     };
     linkComponents.set(k, c);
     if (linkComponents.size > 64) linkComponents.delete(linkComponents.keys().next().value!);
@@ -590,21 +608,27 @@ export const Markdown = memo(function Markdown({ text: raw, small, compact, mid,
   const remarkPlugins = lineBreaks ? REMARK_LINES : REMARK;
   const wantsMath = useMemo(() => hasMath(md), [md]);
   const katex = useMath(wantsMath);
-  // The step that lifts block pictures into runs, once the text names a web picture (#9475).
-  const images = useReplyImages(useMemo(() => /!\[[^\]\n]*\]\(\s*<?https?:/i.test(text), [text]))?.rehypeReplyImages;
-  const picturesContext = useMemo(() => ({ text, ask: Boolean(askImages) }), [text, askImages]);
+  // The step that lifts block pictures into runs, once the text names a web or (with `mid`) local picture (#9475, #12288).
+  const wantsReplyImages = useMemo(() => (mid ? /!\[[^\]\n]*\]\(/.test(text) : /!\[[^\]\n]*\]\(\s*<?https?:/i.test(text)), [text, mid]);
+  const images = useReplyImages(wantsReplyImages)?.rehypeReplyImages;
+  const picturesContext = useMemo(() => ({ text, ask: Boolean(askImages), mid, cwd }), [text, askImages, mid, cwd]);
   const rehypePlugins = useMemo<PluggableList>(
-    () => [...(images ? [images] : []), ...(katex ? [katex] : []), ...(highlight ? [highlight] : []), ...(key ? [rehypePathLinks(linkable)] : []), rehypeLinkedCode],
+    () => [...(images ? [[images, { local: Boolean(mid) }] as [typeof images, { local: boolean }]] : []), ...(katex ? [katex] : []), ...(highlight ? [highlight] : []), ...(key ? [rehypePathLinks(linkable)] : []), rehypeLinkedCode],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [key, highlight, katex, images],
+    [key, highlight, katex, images, Boolean(mid)],
   );
-  const chunks = useMemo(() => (streaming ? splitChunks(md) : wordFade ? [{ start: 0, content: md }] : null), [md, streaming, wordFade]);
+  // Keep the first parser (and its paragraph/selection) mounted when a stream settles. Parse the
+  // finished text as a whole document so cross-block references and footnotes still resolve.
+  const streamed = useRef(false);
+  useEffect(() => { if (streaming) streamed.current = true; }, [streaming]);
+  const retainParser = streamed.current;
+  const chunks = useMemo(() => streaming ? splitChunks(md) : wordFade || retainParser ? [{ start: 0, content: md }] : null, [md, streaming, wordFade, retainParser]);
   // A finished block: its tree from the cache when this text was drawn with the same plugins and links before.
   const tree = useMemo(
     () =>
       chunks || !markdownCache.on
         ? null
-        : cachedMarkdown(markdownKey(md, `${katex ? "katex" : ""}|${highlight ? "highlight" : ""}|${images ? "images" : ""}|${key}`, mid, cwd), { children: md, remarkPlugins, rehypePlugins, components, urlTransform: markdownUrl }),
+        : cachedMarkdown(markdownKey(md, `${katex ? "katex" : ""}|${highlight ? "highlight" : ""}|${images ? (mid ? "images:local" : "images") : ""}|${key}`, mid, cwd), { children: md, remarkPlugins, rehypePlugins, components, urlTransform: markdownUrl }),
     [chunks, md, katex, highlight, images, key, mid, cwd, remarkPlugins, rehypePlugins, components],
   );
   return (

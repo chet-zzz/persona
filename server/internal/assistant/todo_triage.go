@@ -156,6 +156,9 @@ func triageStatus(t Todo, look triageLookup, now time.Time) string {
 		}
 	}
 	if len(active) == 0 {
+		if t.Responsible != nil {
+			return "follow_up"
+		}
 		return "not_started"
 	}
 	var interrupted, limited, unread, working, waiting bool
@@ -178,6 +181,11 @@ func triageStatus(t Todo, look triageLookup, now time.Time) string {
 		switch {
 		case found && triageUsageLimit(s, now):
 			limited = true
+		case found && triageInterrupted(s, now) && (proto.UnrecoverableTurnErrorCode(s.TurnError) != "" ||
+			s.TurnErrorKind == proto.TurnErrorUnrecoverable || s.TurnErrorCode == proto.TurnErrorCompactionSealed):
+			interrupted = true
+		case len(active) > 1 && st != proto.StateWorking && found && triageAgentWaits(s):
+			waiting = true
 		case found && triageInterrupted(s, now):
 			interrupted = true
 		case st == proto.StateUnread:
@@ -189,7 +197,7 @@ func triageStatus(t Todo, look triageLookup, now time.Time) string {
 		}
 	}
 	switch {
-	case interrupted:
+	case interrupted && !working && !waiting && (t.Supervision == nil || t.Supervision.State != "parked"):
 		return "interrupted"
 	case limited:
 		return "usage_limit"
@@ -218,13 +226,24 @@ func acceptanceStands(t Todo) bool {
 	return t.Supervision != nil && t.Supervision.State == reviewAccepted && r != nil && r.Verdict == reviewAccepted
 }
 
-// triageReviewState is the review state that holds now (the web's reviewState): a cancelled task reopened goes on
-// again; an accepted one stays accepted while its acceptance stands.
+// triageReviewState is the current review for the task list. A decision from before reopening stays in history;
+// an accepted task stays accepted while its acceptance stands.
 func triageReviewState(t Todo) string {
 	if t.Supervision == nil {
 		return ""
 	}
+	if ownerDecisionReturned(t.Supervision) {
+		return ""
+	}
 	st := t.Supervision.State
+	if st == reviewNeedsUser && t.ReopenedAt != nil {
+		if r := triageLatestReview(t.Supervision); r == nil || r.At.Before(*t.ReopenedAt) {
+			return "" // the previous round's decision stays in review history
+		}
+	}
+	if st == reviewUserCheck && t.DoneAt != nil {
+		return reviewAccepted
+	}
 	if t.DoneAt == nil && (st == reviewAccepted && !acceptanceStands(t) || st == reviewCancelled) {
 		return ""
 	}
@@ -321,7 +340,7 @@ func triageWaitingForMerge(t listedTodo, status string, now time.Time) bool {
 		return false
 	}
 	dismissed := t.DecisionReview != nil && t.DecisionReview.DismissalID != ""
-	if !dismissed && (triageReviewState(t.Todo) == reviewNeedsUser || t.Ask != nil && (t.Ask.Outcome == outcomeDecide || t.Ask.Outcome == outcomeCannot)) {
+	if !dismissed && (triageReviewState(t.Todo) == reviewNeedsUser || triageReviewState(t.Todo) == reviewUserCheck || t.Ask != nil && (t.Ask.Outcome == outcomeDecide || t.Ask.Outcome == outcomeCannot)) {
 		return false
 	}
 	return true
@@ -395,7 +414,8 @@ func triageTodo(t listedTodo, look triageLookup, now, restoredAt time.Time, loc 
 		return at(triageDone, ruleFailedStart)
 	case status == "needs_you" || status == "interrupted":
 		return at(triageWaiting, ruleAgentAsks)
-	case t.DoneAt == nil && !dismissed && (review == reviewNeedsUser || ask != nil && (ask.Outcome == outcomeDecide || ask.Outcome == outcomeCannot)):
+	case t.DoneAt == nil && (review == reviewUserCheck || t.Delivery.waitsForOwner() ||
+		!dismissed && (review == reviewNeedsUser || ask != nil && (ask.Outcome == outcomeDecide || ask.Outcome == outcomeCannot))):
 		return at(triageWaiting, ruleOwnerDecides)
 	case !settled && !(finished && !seen(last) && review != reviewParked) && triageWaitingForMerge(t, status, now):
 		// rule 9 after rule 8: a turn or review nobody has looked at stays Just finished even with its PR open. A parked

@@ -61,7 +61,7 @@ func (n *Node) editableLarkCall(cfg proto.AssistantLark, command, cwd string) (l
 	if !larkLoneGateCall(command, cfg.Gates) {
 		return larkCall{}, larkBodySpan{}, "", false
 	}
-	v := classifyLark(command, cfg.Gates, cwd, n.larkCLIRisk(cfg))
+	v := classifyLarkWith(command, cfg.Gates, cwd, n.larkCLIRisk(cfg), n.larkLoginPATH)
 	if v.deny != "" || v.other || v.unparsed || v.unknown || v.unsure || len(v.calls) != 1 {
 		return larkCall{}, larkBodySpan{}, "", false
 	}
@@ -152,7 +152,7 @@ func (n *Node) applyLarkEdit(ctx context.Context, cfg proto.AssistantLark, sessi
 		return "", fmt.Errorf("the edited command could not be rebuilt")
 	}
 	command = updated
-	v := classifyLark(command, cfg.Gates, cwd, n.larkCLIRisk(cfg))
+	v := classifyLarkWith(command, cfg.Gates, cwd, n.larkCLIRisk(cfg), n.larkLoginPATH)
 	if v.deny != "" || v.other || v.unparsed || v.unknown || v.unsure || len(v.calls) != 1 {
 		return "", fmt.Errorf("the edited command is no longer one standalone gated call")
 	}
@@ -227,7 +227,7 @@ func (n *Node) takeOriginalGrant(cfg proto.AssistantLark, session, id string, c 
 		if g.session != "" && key.session != "" && g.session != key.session {
 			continue
 		}
-		if g.body != nil && (!parsed || !reflect.DeepEqual(g.body, body)) {
+		if g.bodyBound && (!parsed || !reflect.DeepEqual(g.body, body)) {
 			continue
 		}
 		p.grants = slices.Delete(p.grants, i, i+1)
@@ -248,7 +248,7 @@ func (n *Node) grantEdited(cfg proto.AssistantLark, session string, c larkCall, 
 	if err := dec.Decode(&body); err != nil {
 		return err
 	}
-	g := gateGrant{command: cfg.Gates[c.Gate].Command, method: strings.ToUpper(c.Method), path: c.Path, query: gateQueryKey(c.Query), body: body, bodyUseNumber: true,
+	g := gateGrant{command: cfg.Gates[c.Gate].Command, method: strings.ToUpper(c.Method), path: c.Path, query: gateQueryKey(c.Query), body: body, bodyBound: true, bodyUseNumber: true,
 		until: time.Now().Add(gateGrantFor), session: session, through: through}
 	p := n.gates()
 	p.mu.Lock()

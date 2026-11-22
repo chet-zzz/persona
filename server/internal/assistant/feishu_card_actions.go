@@ -37,6 +37,8 @@ func (s *Service) FeishuAction(ctx context.Context, p FeishuAction) (*feishubot.
 func (s *Service) botCardAction(ctx context.Context, a *feishubot.CardAction, action string) *feishubot.CardResponse {
 	l := s.botLang(ctx)
 	switch a.Str("a") {
+	case "nop": // a link of a "more" menu was opened: nothing to do
+		return nil
 	case "ix":
 		return s.answerFromCard(ctx, a, action)
 	case "accept":
@@ -54,6 +56,7 @@ func (s *Service) botCardAction(ctx context.Context, a *feishubot.CardAction, ac
 				result, err = s.chooseOption(ctx, a.Str("id"), "", opt)
 			}
 			ask.Chosen = opt
+			ask.OptionTaken = result.taken && err == nil // this successful click, not an ambiguous legacy choice
 			if opt == ask.Recommend {
 				ask.Chosen = "" // the recommended one: taken as OK takes it
 			}
@@ -64,6 +67,9 @@ func (s *Service) botCardAction(ctx context.Context, a *feishubot.CardAction, ac
 		}
 		if errors.Is(err, errAcceptStore) { // the asks could not be read or saved: not accepted, the button works again
 			return toast("error", i18n.T(l, "http-status.unavailable"))
+		}
+		if note := inDoubtNote(l, err); note != "" { // it may be with the agent already: look before pressing again
+			return toast("error", note)
 		}
 		if err != nil { // another delivery failure: not taken, nothing recorded, the button works again
 			return toast("error", i18n.T(l, "assistant-reports.accept_not_taken", i18n.Args{"error": clip(oneLine(i18n.Localize(err, l)), 120)}))
@@ -164,10 +170,10 @@ func (s *Service) botCardAction(ctx context.Context, a *feishubot.CardAction, ac
 	case "ib": // an Inbox button of the workbench's /inbox card
 		return s.workbenchInboxAction(ctx, a)
 	case "stop":
-		// The progress card's Stop button: the run's own conversation, carried in the button when the card was built.
+		// A progress card may outlive its run when its final edit was refused.
 		f, _ := s.feishuFeatures(ctx)
 		t := botTarget{Kind: a.Str("k"), MachineID: a.Str("m"), SessionID: a.Str("s")}
-		out := s.stopConversation(ctx, f, t)
+		out := s.stopProgressCard(ctx, f, t, a.Context.MessageID)
 		return toast(out.kind, out.message)
 	}
 	return toast("info", i18n.T(l, "assistant-feishu_cards.card_expired"))
@@ -216,6 +222,64 @@ func (s *Service) answerFromCard(ctx context.Context, a *feishubot.CardAction, a
 			Card: s.answeredCard(ctx, ix, ended).Raw()}
 	}
 	ix := got.Interaction
+	type outcome struct {
+		ok  bool
+		err error
+	}
+	if a.Str("clarify") == "1" {
+		question := a.Form("question")
+		if !ix.CanClarify || ix.Private {
+			return toast("error", i18n.T(l, "assistant-feishu_cards.unknown_action"))
+		}
+		if err := validateClarifyQuestion(question); err != nil {
+			return toast("warning", err.Error())
+		}
+		// The callback token identifies this form delivery. Replaying it uses the
+		// same owner-message ID, while a later deliberate press gets a fresh one.
+		// Older callbacks without a token still have their one-use owner action;
+		// never collapse every tokenless question on this card into one delivery.
+		delivery := strings.TrimSpace(a.Token)
+		if delivery == "" {
+			delivery = strings.TrimSpace(action)
+		}
+		if delivery == "" {
+			delivery = randomHex(8)
+		}
+		clientMsgID := channel.ClientMsgID(channel.Feishu, "approval-"+delivery)
+		done := make(chan outcome, 1)
+		go func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			ok, err := s.clarifyInteraction(rctx, channel.Feishu, id, question, clientMsgID, action, a.Context.ChatID, a.Context.MessageID)
+			done <- outcome{ok, err}
+		}()
+		select {
+		case o := <-done:
+			if o.err != nil {
+				return toast("error", clip(oneLine(o.err.Error()), 120))
+			}
+			if !o.ok {
+				return toast("info", i18n.T(l, "assistant-feishu_cards.already_handled"))
+			}
+			return toast("success", i18n.T(l, "assistant-feishu_cards.question_sent_pending"))
+		case <-time.After(cardAnswerWait):
+			msg := a.Context.MessageID
+			go func() {
+				o := <-done
+				if msg == "" {
+					return
+				}
+				nctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				if o.err != nil {
+					s.botNote(nctx, msg, i18n.T(l, "assistant-feishu_cards.press_not_sent", i18n.Args{"error": clip(oneLine(o.err.Error()), 200)}))
+				} else if o.ok {
+					s.botNote(nctx, msg, i18n.T(l, "assistant-feishu_cards.question_sent_pending"))
+				}
+			}()
+			return toast("info", i18n.T(l, "assistant-feishu_cards.working_on_it"))
+		}
+	}
 	yes, no := true, false
 	var r proto.Resolution
 	switch {
@@ -287,10 +351,6 @@ func (s *Service) answerFromCard(ctx context.Context, a *feishubot.CardAction, a
 		return false
 	}
 	how := resolutionText(l, ix, r)
-	type outcome struct {
-		ok  bool
-		err error
-	}
 	// Screen and Codex cards act on the terminal and can take a few seconds; Feishu waits 3 s for this answer.
 	done := make(chan outcome, 1)
 	go func() {
@@ -461,17 +521,19 @@ func (s *Service) botStartAgent(machine, cwd, prompt, mode string) error {
 		return err
 	}
 	t := botTarget{Kind: targetAgent, MachineID: d.ID, SessionID: res.Session.SessionID}
-	label := agentLabel(res.Session)
+	preferTab := s.useHerdrTabName(ctx)
+	label, secondary := feishuSessionNames(res.Session, preferTab)
 	if label == "" || label == "." {
 		label = cwd
 	}
 	label += " · " + d.Name
 	s.setBotCurrent(t)
-	c := feishubot.NewCard("", "", i18n.T(l, "assistant-feishu_cards.started")).Markdown(i18n.T(l, "assistant-feishu_cards.started_body", i18n.Args{"machine": feishubot.EscapeMarkdown(d.Name), "dir": feishubot.Code(cwd)}))
+	c := feishubot.NewCard(i18n.T(l, "assistant-feishu_cards.started"), feishubot.Blue, i18n.T(l, "assistant-feishu_cards.started")).Subtitle(dotJoin(label, secondary)).
+		Markdown(i18n.T(l, "assistant-feishu_cards.started_body", i18n.Args{"machine": feishubot.EscapeMarkdown(d.Name), "dir": feishubot.Code(cwd)}))
 	if prompt != "" {
 		c.Note(i18n.T(l, "assistant-feishu_cards.started_working"))
 	}
-	mid, err := s.botPost(ctx, "", c.Buttons(s.openButton(ctx, d.ID, res.Session.SessionID)), "")
+	mid, err := s.botPost(ctx, "", c.AppendToLinks(s.openButton(ctx, d.ID, res.Session.SessionID)), "")
 	if err != nil {
 		s.logf("bots: started note: %v", err)
 	}

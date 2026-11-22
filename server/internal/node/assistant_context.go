@@ -95,7 +95,7 @@ func rowTodo(row string) string {
 	return ""
 }
 
-// rowLabel is the label a row starts with: "- Working: ..." is "Working", "- Done (24 hours): ..." is "Done".
+// rowLabel is the label a row starts with: "- Needs you: ..." is "Needs you", "- Done (24 hours): ..." is "Done".
 func rowLabel(row string) string {
 	label, ok := strings.CutPrefix(strings.TrimSpace(row), listMark)
 	if !ok || !strings.Contains(label, "：") {
@@ -257,6 +257,13 @@ func (n *Node) turnContext(id string, c contextAnswer) (block string, commit fun
 		block = strings.TrimSpace(block + "\n" + c.ViewErrors)
 	}
 	return block, func() {
+		n.state.update(id, func(v *sessionState) bool {
+			if !v.AwaitingFirstMessage {
+				return false
+			}
+			v.AwaitingFirstMessage = false
+			return true
+		})
 		if len(c.Receipts) > 0 {
 			n.ackViewErrors(id, c.Receipts)
 		}

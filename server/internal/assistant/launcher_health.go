@@ -12,6 +12,8 @@ import (
 	"github.com/nwverse/persona/server/internal/apierr"
 	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/lazyre"
+	"github.com/nwverse/persona/server/internal/proto"
+	"github.com/nwverse/persona/server/internal/textfmt"
 )
 
 // Launcher health (docs/server/launcher-health.md): every launcher on every machine is checked now and then with the same
@@ -58,7 +60,7 @@ var (
 	// hub's restarts would otherwise check everything each time).
 	healthOnlineRecheck = 10 * time.Minute
 	// healthStale: a failure older than this no longer keeps a launcher from being used (a usage limit with a known
-	// reset: until the reset instead).
+	// reset, its own or one of its families': until the reset instead). An agent's turn counts from its own time.
 	healthStale = 6 * time.Hour
 	// healthLimitMax: a usage limit said to reset further ahead than this was misread (a weekly limit resets within 7
 	// days): the record counts as one without a reset.
@@ -285,7 +287,7 @@ func (s *Service) healthRecords(ctx context.Context, state, machine string) []La
 	out := []LauncherHealth{}
 	for _, r := range b.recs {
 		if (state == "" || r.State == state) && (machine == "" || r.Machine == machine) {
-			out = append(out, *r)
+			out = append(out, cleanHealth(*r))
 		}
 	}
 	b.mu.Unlock()
@@ -302,13 +304,35 @@ func (s *Service) launcherHealth(ctx context.Context, machine, launcher string) 
 	defer b.mu.Unlock()
 	s.healthLoadLocked(ctx)
 	if r := b.recs[healthKey(machine, launcher)]; r != nil {
-		return *r, true
+		return cleanHealth(*r), true
 	}
 	return LauncherHealth{}, false
 }
 
+// cleanHealth is a copy of r whose text is safe to show: records written before the cleanup (an older hub, a raw
+// start's error) can still carry terminal escapes and shell startup noise in Postgres, and every list hands them out.
+func cleanHealth(r LauncherHealth) LauncherHealth {
+	if r.Error != "" {
+		r.Error = textfmt.LauncherErrorSummary(r.Error, 400)
+	}
+	if r.BlockedReason != "" {
+		r.BlockedReason = textfmt.Clip(textfmt.OneLine(textfmt.StripTerminalEscapes(r.BlockedReason)), 600)
+	}
+	return r
+}
+
+// cleanCheck cleans a check's answer as it is handed on: a node from before the cleanup still sends the terminal's
+// escapes and shell startup noise in it.
+func cleanCheck(c *proto.LauncherCheck) {
+	if c.Error != "" {
+		c.Error = textfmt.LauncherErrorSummary(c.Error, 400)
+	}
+	c.Answer = textfmt.StripTerminalEscapes(c.Answer)
+}
+
 // unusable: the record says the launcher does not work (its latest result, failed within healthStale). A usage limit
-// whose reset is known holds until that reset, however far off, and no longer.
+// whose reset is known holds until that reset, however far off, and no longer. One whose reset is unknown holds
+// within healthStale, and until any of its families' known resets (familyResetAhead).
 func (r LauncherHealth) unusable() bool {
 	if r.State == "" || r.State == healthOK {
 		return false
@@ -316,7 +340,24 @@ func (r LauncherHealth) unusable() bool {
 	if reset, ok := r.limitReset(); ok {
 		return time.Now().Before(reset)
 	}
-	return time.Since(r.CheckedAt) < healthStale
+	return time.Since(r.CheckedAt) < healthStale || r.familyResetAhead()
+}
+
+// familyResetAhead: r's usage limit has a family whose own reset is known and still ahead (and not past
+// healthLimitMax from the record's evidence). Another family whose reset is unknown makes the limit's reset unknown
+// (familiesReset), and that family's evidence goes stale, but it takes nothing from this one: nothing a failure adds
+// shortens a limit (foldLimit, #9646).
+func (r LauncherHealth) familyResetAhead() bool {
+	if r.Kind != errKindUsageLimit {
+		return false
+	}
+	now := time.Now()
+	for _, t := range r.LimitResets {
+		if now.Before(t) && t.Sub(r.CheckedAt) <= healthLimitMax {
+			return true
+		}
+	}
+	return false
 }
 
 // limitReset is when the usage limit r records resets: r failed on the subscription's usage limit, and its reset is

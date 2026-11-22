@@ -9,15 +9,15 @@
 // it and starts picking there with that message picked (lib/message-pick.ts, views/chat/Picking.tsx: they come with this
 // dialog, so the chat draws them at once); opened for the picked ones, it shows them as
 // one card, and each goes as a block of its own, in the chat's order, each cut at its share (forward-block.ts forwardLimit).
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { t } from "../../i18n";
 import { errorText, fullItem, imageURL } from "../../lib/api";
 import { imagePayload, MAX_IMAGE } from "../../lib/attachments";
-import { MAX_IMAGES } from "../../lib/composer-commands";
+import { imageLimitsFor } from "../../lib/image-limits";
 import { sendDraft, type DraftImage } from "../../lib/drafts";
 import type { ForwardBatch, ForwardDraft } from "../../lib/forward";
+import { forwardDraftOf } from "../../lib/forward-draft";
 import { forwardRuns } from "../../lib/forward-group";
-import { messagePick } from "../../lib/message-pick";
 import { forwardLimit, forwardRef, forwardRoute } from "../../lib/forward-block";
 import { forwardSessions, PERSONA_TARGET, rememberForward, sessionTarget } from "../../lib/forward-memory";
 import { forwardSections, keyOf, targetDetail, targetTitle, type TargetSection } from "../../lib/forward-targets";
@@ -41,9 +41,8 @@ import { StatusMark } from "../../ui/StatusMark";
 import { conversationTitle } from "../assistant/conversations";
 import { ForwardBar } from "./ForwardBar";
 import { ForwardGroupBar } from "./ForwardGroup";
-import { PickBar, PickRow } from "./Picking";
-import { pickParts } from "./picking-parts";
-import { readPhoto } from "./QueueStrip";
+import { startPick } from "./Picking";
+import { readPhoto } from "./queue-restore";
 
 type Target = { kind: "persona" } | { kind: "new" } | { kind: "session"; s: Session };
 
@@ -73,7 +72,8 @@ async function readImage(mid: string, sid: string, item: Item): Promise<DraftIma
 }
 
 /** The forwards with their whole text and their pictures, as they go: each cut at its share of the budget, the pictures
- *  of all of them up to a message's MAX_IMAGES; `lost`: pictures that could not be read. */
+ *  of all of them up to the pictures a message holds (lib/image-limits.ts; the box sends any it has no room for as files);
+ *  `lost`: pictures that could not be read. */
 async function complete(drafts: ForwardDraft[]): Promise<{ refs: ContextRef[]; images: DraftImage[]; lost: number }> {
   const limit = forwardLimit(drafts.length);
   const raws = await Promise.all(drafts.map(async (d) => (d.cut ? ((await fullItem(d.source.mid, d.source.sid, d.cut)).text ?? d.raw) : d.raw)));
@@ -82,7 +82,7 @@ async function complete(drafts: ForwardDraft[]): Promise<{ refs: ContextRef[]; i
       const { mid, sid } = d.source;
       return [...(d.images ?? []).map((i) => () => readImage(mid, sid, i)), ...(d.photos ?? []).map((p) => () => readPhoto(mid, p, d.cwd))];
     })
-    .slice(0, MAX_IMAGES);
+    .slice(0, imageLimitsFor().per_message);
   const read = await Promise.all(wanted.map((f) => f()));
   const images = read.filter((x): x is DraftImage => Boolean(x));
   return { refs: drafts.map((d, i) => forwardRef(raws[i], d.source, limit)), images, lost: read.length - images.length };
@@ -128,11 +128,25 @@ function deliver(target: Target, refs: ContextRef[], images: DraftImage[], lost:
   else navigate({ name: "session", mid: s.machine_id, sid: s.session_id, view: "chat" });
 }
 
-export function ForwardDialog({ batch, open, onClose }: { batch: ForwardBatch; open: boolean; onClose: () => void }) {
+export function ForwardDialog(props: { batch: ForwardBatch; open: boolean; onClose: () => void }) {
+  return props.batch.now ? <StartNow batch={props.batch} onClose={props.onClose} /> : <ForwardPicker {...props} />;
+}
+
+/** The message menu's Select messages (#9469): picking starts with that message, the picker never shown. */
+function StartNow({ batch, onClose }: { batch: ForwardBatch; onClose: () => void }) {
+  useEffect(() => {
+    const s = batch.select;
+    if (s) s.start(startPick(s.first));
+    onClose();
+  }, [batch, onClose]);
+  return null;
+}
+
+function ForwardPicker({ batch, open, onClose }: { batch: ForwardBatch; open: boolean; onClose: () => void }) {
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const drafts = batch.drafts;
+  const drafts = useMemo(() => batch.drafts ?? batch.from?.picks.map((p) => forwardDraftOf(batch.from!.chat, p)) ?? [], [batch]);
   const draft = drafts[0];
   // what the page holds as it opens (iOS reads the list once): rows don't move under the pointer while it is open
   const held = useMemo(() => ({ sessions: heldSessions(), machines: getState().machines, assistant: getState().assistant, recents: forwardSessions() }), [batch]);
@@ -211,11 +225,7 @@ export function ForwardDialog({ batch, open, onClose }: { batch: ForwardBatch; o
                   onClick={() => {
                     onClose();
                     // what the chat draws while it picks comes with this dialog: handed over before it starts
-                    pickParts.Row = PickRow;
-                    pickParts.Bar = PickBar;
-                    const pick = messagePick();
-                    pick.start(select.first);
-                    select.start(pick);
+                    select.start(startPick(select.first));
                   }}
                   data-forward-select
                 >

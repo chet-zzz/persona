@@ -17,6 +17,9 @@ func (h *Hub) withInjected(items []proto.Item) []proto.Item {
 	for i := range items {
 		it := &items[i]
 		it.Source = prompts.ItemSource(*it)
+		if it.Source != nil && it.Source.Kind == proto.SourceScheduledTask {
+			continue // already classified by the runtime; its visible instructions are not a Persona envelope
+		}
 		if it.Role != "user" || it.Kind != proto.KindText || it.ClientMsgID != "" || it.From != "" || it.Injected != nil || prompts.UserAuthoredContext(it.Text) {
 			continue
 		}
@@ -78,6 +81,8 @@ func injectedLine(l i18n.Lang, in *proto.Injected) string {
 		}
 	case proto.InjectedSystem:
 		switch in.State {
+		case "answer_again":
+			return i18n.T(l, "injected.answer_again")
 		case "inbox":
 			return i18n.T(l, "injected.inbox_update", args)
 		case "ask_answered":

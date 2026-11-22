@@ -1,6 +1,6 @@
 import type { AgentState, Interaction, Session, SessionCapabilities } from "./types";
 import { formatDate, formatRelative, t } from "../i18n";
-import { sessionAgentName } from "./agent-kind";
+import { normalizeTraeCliName, sessionAgentName } from "./agent-kind";
 import { usageLimitLabel } from "./usage-limit";
 import { workLine } from "./work";
 import { closeoutLine, closeoutSuffix, shownCloseout } from "./closeout";
@@ -64,9 +64,9 @@ export function sourceSubtitle(s?: Session): string {
     : s.source_kind === "claude_cli" ? t("lib-format.source_claude_terminal")
     // an agent runtime's session (docs/integrations/runtimes.md): its own name, else its agent's ("Claude Code", a Paseo
     // provider's), never a raw id (#8142)
-    : s.source_kind === "runtime" ? s.agent_label || sessionAgentName(s)
+    : s.source_kind === "runtime" ? normalizeTraeCliName(s.agent_label) || sessionAgentName(s)
     : s.source_kind;
-  const detail = s.source_kind !== "identity_conflict" && s.agent_name ? ` · ${s.agent_name}` : "";
+  const detail = s.source_kind !== "identity_conflict" && s.agent_name ? ` · ${normalizeTraeCliName(s.agent_name)}` : "";
   if (sessionCan(s, "send")) return label + detail;
   const given = s.read_only_reason ?? "";
   const reason = (given.startsWith(NODE_READ_ONLY_PREFIX) ? given.slice(NODE_READ_ONLY_PREFIX.length) : given).trim();
@@ -111,12 +111,19 @@ export function sessionDeletable(s: Session): boolean {
   return !s.assistant && DELETABLE_STATUSES.has(s.status) && !s.starting;
 }
 
-// docs/protocol/agent-states.md: needs you → unread → awaiting reply (seen, awaiting the user's reply, #5096) → working → idle → unknown → offline
-const RANK: Record<AgentState, number> = { needs_you: 0, unread: 1, working: 3, idle: 4, unknown: 5, offline: 6 };
+// docs/protocol/agent-states.md: needs you → unread → awaiting reply (seen, awaiting the user's reply, #5096) → working →
+// just finished (done before anybody looked, #9751) → idle → unknown → offline
+const RANK: Record<AgentState, number> = { needs_you: 0, unread: 1, working: 3, idle: 5, unknown: 6, offline: 7 };
 
-// A seen agent awaiting the user's reply ranks between unread and working. The comparator has no mutes: a muted one
-// awaiting a reply ranks so here too (the sidebar's By Status sections and folds go by lib/agent-groups.ts awaitsReply).
-const rankOf = (s: Session) => (stateOf(s) === "idle" && s.awaits_reply ? 2 : RANK[stateOf(s)]);
+// A seen agent awaiting the user's reply ranks between unread and working, a just finished one between working and the
+// seen ones. The comparator has no mutes: a muted one ranks so here too (the sidebar's By Status sections and folds go
+// by lib/agent-groups.ts awaitsReply and justFinished).
+function rankOf(s: Session): number {
+  const st = stateOf(s);
+  if (st === "idle" && s.awaits_reply) return 2;
+  if (st === "idle" && s.work?.just_finished) return 4;
+  return RANK[st];
+}
 
 export function stateOf(s: Session): AgentState {
   if (s.state) return s.state;
@@ -203,8 +210,30 @@ export function externalLink(s?: Pick<Session, "external_url">): string | undefi
   }
 }
 
-export function sessionTitle(s: Pick<Session, "title" | "cwd">): string {
-  return s.title?.trim() || baseName(s.cwd) || t("lib-format.untitled_session");
+type SessionNameFields = Pick<Session, "title" | "cwd" | "assistant" | "slot_name" | "slot_id" | "tab_id" | "space_kind" | "host">;
+
+export function herdrTabName(s: SessionNameFields): string {
+  const kind = s.space_kind || s.host;
+  if (s.assistant || !(s.slot_id || s.tab_id) || (kind && kind !== "herdr" && kind !== "herdr-core")) return "";
+  return s.slot_name?.trim() || "";
+}
+
+// Keep the terminal prompt recognizer in sync with server/internal/proto/session_name.go.
+const SHELL_PROMPT_TITLE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*@[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:[ \t]+[^\r\n]+|[~/][^\r\n]*)$/;
+
+export function sessionDisplayTab(s: SessionNameFields, preferTab = false): string {
+  const title = s.title?.trim() || "";
+  return preferTab || !title || SHELL_PROMPT_TITLE.test(title) ? herdrTabName(s) : "";
+}
+
+export function sessionTitle(s: SessionNameFields, preferTab = false): string {
+  return sessionDisplayTab(s, preferTab) || s.title?.trim() || baseName(s.cwd) || t("lib-format.untitled_session");
+}
+
+export function sessionTitleDetail(s: SessionNameFields, preferTab: boolean): string {
+  const tab = preferTab ? herdrTabName(s) : "";
+  const title = s.title?.trim() || "";
+  return tab && tab !== title ? title : "";
 }
 
 // A path from a Windows computer: a drive letter or a UNC share. Only there is a backslash a separator; in any other
@@ -287,15 +316,31 @@ export function clock(iso?: string): string {
   return t("lib-format.date_time", { date: formatDate(d, { month: "short", day: "numeric" }), time: hm });
 }
 
+/** 18:20 today, "Yesterday", "Wed" within the week, "Oct 28" this year, else 2025-10-28 (LarkTime.short). */
+export function shortTime(iso?: string, now = new Date()): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime()) || d.getFullYear() < 2000) return "";
+  const day = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((day(now) - day(d)) / 86400_000);
+  if (days <= 0) return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (days === 1) return t("lib-inbox.yesterday");
+  if (now.getTime() - d.getTime() < 6 * 86400_000) return formatDate(d, { weekday: "short" });
+  if (d.getFullYear() === now.getFullYear()) return formatDate(d, { month: "short", day: "numeric" });
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** "512 B", "1.5 KB", "250 MB". The unit and the decimal follow the figure as it is shown, after rounding, as the
+ *  machine pages' bytesBin does: 1023.5 KB is "1.0 MB", not "1024 KB"; 99.95 KB is "100 KB", not "100.0 KB" (#9969). */
 export function bytes(n?: number): string {
   if (n === undefined || !Number.isFinite(n)) return "—";
   const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
-  while (n >= 1024 && i < u.length - 1) {
+  while (n >= 1023.5 && i < u.length - 1) {
     n /= 1024;
     i++;
   }
-  return `${n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
+  return `${n >= 99.95 || i === 0 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }
 
 /**

@@ -33,7 +33,7 @@ nonisolated enum TodoSection: String, CaseIterable, Sendable {
         switch self {
         case .waiting: StateName.needsYou.text
         case .working: StateName.working.text
-        case .justDone: String(localized: "Just Finished")
+        case .justDone: StateName.justFinished.text
         case .pr: String(localized: "PR to Merge")
         case .other: String(localized: "Other Open")
         case .shelved: String(localized: "Shelved")
@@ -91,6 +91,12 @@ nonisolated struct TodoTriageResult: Sendable {
 }
 
 nonisolated enum TodoTriageLogic {
+    /// Legacy raw sealed-compaction detection shared with the app and watch, which do not link PersonaKit.
+    private static func unrecoverableLegacy(_ text: String?) -> Bool {
+        let s = (text ?? "").lowercased()
+        return s.contains("compacted natively") && s.contains("compaction is sealed") && s.contains("to that account")
+    }
+
     /// No activity for this long, nothing of it running: shelved.
     static let shelveAfter: TimeInterval = 48 * 3600
     /// Finished this recently, and not seen since: Just finished; earlier, Done. Seeing it (Got It, or opening it,
@@ -108,7 +114,7 @@ nonisolated enum TodoTriageLogic {
         if todo.doneAt != nil { return .done }
         let active = todo.activeAgents
         if active.isEmpty { return .notStarted }
-        var interrupted = false, limit = false, unread = false, working = false
+        var interrupted = false, limit = false, unread = false, working = false, waiting = false
         for a in active {
             if let e = a.startError, !e.isEmpty { continue } // a failed start counts as stopped
             let s = lookup?(a.machineID, a.sessionID)
@@ -117,11 +123,16 @@ nonisolated enum TodoTriageLogic {
             let stopped = st == .unread || st == .idle
             let error = !(s?.turnError ?? "").isEmpty
             if error, s?.turnErrorKind == "usage_limit", stopped { limit = true }
+            else if error, stopped, (s?.turnErrorKind == "unrecoverable" || s?.turnErrorCode == "compaction_sealed" ||
+                unrecoverableLegacy(s?.turnError)) {
+                interrupted = true
+            }
+            else if st == .working || s?.starting == true { working = true }
+            else if active.count > 1, st != .working, s?.waitsToBeWoken == true { waiting = true }
             else if error, stopped { interrupted = true }
             else if st == .unread { unread = true }
-            else if st == .working || s?.starting == true { working = true }
         }
-        if interrupted { return .interrupted }
+        if interrupted, !working, !waiting, todo.supervision?.state != "parked" { return .interrupted }
         if limit { return .usageLimit }
         if unread { return .unread }
         if working { return .working }
@@ -200,7 +211,8 @@ nonisolated enum TodoTriageLogic {
             return concern ? at(.other, .rest) : at(.done, .failedStart)
         }
         if status == .needsYou || status == .interrupted { return at(.waiting, .agentAsks) }
-        if todo.doneAt == nil, review == .needsUser || ask?.outcome == "decide" || ask?.outcome == "cannot" {
+        if todo.doneAt == nil, review == .userCheck || todo.delivery?.waitsForOwner == true ||
+            review == .needsUser || ask?.outcome == "decide" || ask?.outcome == "cannot" {
             return at(.waiting, .ownerDecides)
         }
         if status == .working { return at(.working, .agentRunning) }
@@ -219,6 +231,20 @@ nonisolated enum TodoTriageLogic {
         if finished, !concern { return at(.done, .seen) }
         if shelvable(todo, now: now, calendar: calendar), now.timeIntervalSince(last) >= shelveAfter { return at(.shelved, .stale) }
         return at(.other, .rest)
+    }
+
+    /// When a to-do the triage filed with the finished ones (Just Finished or Done) finished: the moment its rule reads
+    /// above — its close, its accepting review, its deploy — else its last move (a finished turn the owner has seen since).
+    /// The Assistant's Finished entry lists what finished less than `justDone` ago, seen or not (#10922; the web's
+    /// `finishedAt`). `distantPast` when nothing says.
+    static func finishedAt(_ todo: TodoItem, _ t: TodoTriage) -> Date {
+        switch t.rule {
+        case .closed: todo.doneAt ?? .distantPast
+        case .accepted: todo.supervision?.latestReview?.at ?? .distantPast
+        case .deployed: todo.delivery?.at ?? t.last
+        case .superseded: todo.doneAt ?? t.last
+        default: t.last
+        }
     }
 
     /// Whether a to-do counts toward the header's open count: not closed, not accepted or deployed, not shelved. A

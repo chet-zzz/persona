@@ -99,7 +99,8 @@ type gateKey struct {
 // gateGrant is a call larkCheck let through, to go once.
 type gateGrant struct {
 	command, method, path, query string
-	body                         any  // the JSON body confirmed; nil: any (not JSON, cut short, an upload, $… in it)
+	body                         any  // the JSON body confirmed, when bodyBound (nil there is JSON null)
+	bodyBound                    bool // false: any body (not JSON, cut short, an upload, $… in it)
 	bodyUseNumber                bool // an edited grant compares JSON numbers without float64 rounding
 	until                        time.Time
 	// session is the conversation larkCheck decided for, and through how it let the call through: what the ledger says
@@ -220,7 +221,7 @@ func (p *gateProxy) grant(command, session string, c larkCall, through proto.Lar
 	if !strings.Contains(c.Body, "$") {
 		var v any
 		if json.Unmarshal([]byte(c.Body), &v) == nil {
-			g.body = v
+			g.body, g.bodyBound = v, true
 		}
 	}
 	p.mu.Lock()
@@ -280,7 +281,7 @@ func (p *gateProxy) take(k gateKey, method, path, query string, body []byte, isJ
 			}
 			candidate, candidateParsed = sentNumbers, numbersParsed
 		}
-		if g.body != nil && (!candidateParsed || !reflect.DeepEqual(g.body, candidate)) {
+		if g.bodyBound && (!candidateParsed || !reflect.DeepEqual(g.body, candidate)) {
 			continue
 		}
 		p.grants = slices.Delete(p.grants, i, i+1)
@@ -313,10 +314,14 @@ func (p *gateProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g := cfg.Gates[gi]
-	up, err := url.Parse(g.Env[g.BaseEnv])
-	if err != nil || up.Host == "" || up.Scheme != "http" && up.Scheme != "https" {
-		gateRefuse(w, http.StatusServiceUnavailable, command+" 没有可用的接口地址（扩展没给，或者给的不对）。")
-		return
+	var up *url.URL
+	if !g.Relay { // a relayed gate's API is the extension's socket at the manager (gate.relay, #12904)
+		var err error
+		up, err = url.Parse(g.Env[g.BaseEnv])
+		if err != nil || up.Host == "" || up.Scheme != "http" && up.Scheme != "https" {
+			gateRefuse(w, http.StatusServiceUnavailable, command+" 没有可用的接口地址（扩展没给，或者给的不对）。")
+			return
+		}
 	}
 	restPath, err := url.PathUnescape("/" + rest)
 	if err != nil {
@@ -388,6 +393,10 @@ func (p *gateProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.reportSent(n, proto.LarkSent{Command: command, Method: c.Method, Path: c.Path, SessionID: session, LetThrough: through}, body, isJSON, sw.reply)
 		}
 	}()
+	if g.Relay {
+		p.relay(r.Context(), n, sw, r, command, restPath, g.Headers)
+		return
+	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			out := pr.Out

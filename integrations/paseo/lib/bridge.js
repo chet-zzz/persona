@@ -6,9 +6,11 @@
 // Everything Paseo-specific comes in through deps.paseo, so the tests drive it with a fake daemon.
 
 import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
 import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 import { createRuntime, interactionId, light, page, RpcError, snippet } from '../../runtime-sdk/index.js'
 import {
   AUTO_ACCEPT, AUTO_ACCEPT_ROOTS, CHECK_LABEL, EFFORTS, KEPT, KEPT_LABEL, RUNTIME, SESSION_ID, SESSION_LABEL, WORKSPACE_ID, agentRoot, agentRow,
@@ -56,6 +58,7 @@ const TIMEOUT = Symbol('timeout')
 // workspace.create waits for git worktree add (Paseo gives it 2 minutes), not for the workspace's setup, within the node's
 // 140 s for the call.
 const CREATE_WAIT = 135_000 // ms
+const readGit = promisify(execFile)
 // workspace.archive waits for Paseo to remove a worktree it made (its worktree removal takes 2 minutes at most, then
 // its teardown), within the node's 140 s for the call.
 const ARCHIVE_WAIT = 135_000 // ms
@@ -183,6 +186,7 @@ export function createPaseoBridge(deps = {}, options = {}) {
     resume: true,
     // start() runs permission_mode plan in Paseo's plan mode or refuses it (holdsPlan).
     readonly: true,
+    backend_workspace_root: true,
     // start() runs only Paseo's own providers: a launcher it lacks gets one of the same kind, said on the answer, or a
     // refusal (sameKindProvider); as the machine's engine its providers are all that a start there can run.
     sameKind: true,
@@ -1643,6 +1647,9 @@ export function createPaseoBridge(deps = {}, options = {}) {
    */
   async function deliverMessage(params, wait) {
     const agent = agentFor(params.session_id)
+    if (params.a2a_wake_on_send && agent.archivedAt) {
+      throw new RpcError('The receiving agent was archived', 'a2a_session_busy', { delivered: 'none' })
+    }
     const text = typeof params.text === 'string' ? params.text : ''
     const images = (params.images ?? []).filter((i) => i?.data).map((i) => ({ data: i.data, mimeType: i.mime || 'image/jpeg' }))
     if (!text.trim() && images.length === 0) throw new RpcError('消息是空的', 'bad_request')
@@ -2052,6 +2059,49 @@ export function createPaseoBridge(deps = {}, options = {}) {
     return { checkouts: paseoCheckouts(worktreesBase(), root) }
   }
 
+  /**
+   * Resolve creation ownership from a fresh, complete project list. Path aliases are the same directory; a linked
+   * worktree can use its main checkout's project. Names and remotes never identify a project (clones stay separate).
+   * An unavailable list or several matching records is not permission to allocate another project or guess one.
+   */
+  async function projectAt(dir) {
+    let res
+    try {
+      res = await paseo.request('project.list.request', {}, { timeoutMs: 10_000 })
+    } catch (err) {
+      throw new RpcError(`Cannot read Paseo projects: ${err.message}. Retry before creating anything.`, 'project_unavailable')
+    }
+    if (!Array.isArray(res?.projects) || res.error || res.projects.some((p) => typeof p?.projectId !== 'string' || !p.projectId ||
+      typeof p.projectRootPath !== 'string' || !isAbsolute(p.projectRootPath))) {
+      throw new RpcError('Paseo did not return a complete project list. Retry before creating anything.', 'project_unavailable')
+    }
+    if (!res.projects.length) return undefined
+    // Do not use the display cache: a symlink may have moved since the last session list.
+    const physical = (path) => {
+      try { return realpathSync(path) } catch { return resolve(path) }
+    }
+    const roots = new Set([physical(dir)])
+    try {
+      // Older Git versions do not support --path-format. The common directory is relative to this command's cwd.
+      const { stdout } = await readGit('git', ['-C', dir, 'rev-parse', '--show-toplevel', '--git-common-dir'],
+        { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024, env: { ...process.env, LC_ALL: 'C' } })
+      const [top, common] = stdout.trim().split('\n')
+      if (!top || !common) throw new Error('Git returned no checkout identity')
+      roots.add(physical(top))
+      const gitDir = physical(resolve(dir, common))
+      roots.add(basename(gitDir) === '.git' ? dirname(gitDir) : gitDir)
+    } catch (err) {
+      if (err.code !== 128 || !/not a git repository/i.test(err.stderr ?? '')) {
+        throw new RpcError('Cannot identify this checkout. Retry before creating anything.', 'project_unavailable')
+      }
+    }
+    const matches = new Set(res.projects.filter((p) => !p.archivedAt && roots.has(physical(p.projectRootPath))).map((p) => p.projectId))
+    if (matches.size > 1) {
+      throw new RpcError('More than one Paseo project matches this folder. Choose a workspace in the intended project.', 'project_ambiguous')
+    }
+    return matches.values().next().value
+  }
+
   /** Paseo's worktrees root: its config's worktrees.root, else <Paseo home>/worktrees (its config.js resolveWorktreesRoot). */
   function worktreesBase() {
     const home = options.home ?? paseo.home
@@ -2076,6 +2126,7 @@ export function createPaseoBridge(deps = {}, options = {}) {
    * once git made the checkout; the workspace's own setup runs after.
    */
   async function createWorkspace(params) {
+    const deadline = Date.now() + CREATE_WAIT
     if (!paseo.connected) throw new RpcError('Paseo is not connected (not running, or restarting). Nothing was created.', 'unavailable')
     const named = typeof params.workspace_id === 'string' && params.workspace_id ? params.workspace_id : undefined
     const from = named ? workspaces.get(named) : undefined
@@ -2093,9 +2144,12 @@ export function createPaseoBridge(deps = {}, options = {}) {
       if (branch) source.branchName = branch
     }
     if (typeof params.name === 'string' && params.name.trim()) source.worktreeSlug = params.name.trim()
+    if (from && !from.projectId) throw new RpcError('Paseo did not report this workspace\'s project. Refresh the list.', 'project_unavailable')
+    const projectId = from ? from.projectId : await projectAt(cwd)
+    if (projectId) source.projectId = projectId
     const req = { source }
     if (typeof params.key === 'string' && params.key) req.idempotencyKey = params.key.slice(0, 512)
-    const res = await paseo.request('workspace.create.request', req, { timeoutMs: CREATE_WAIT })
+    const res = await paseo.request('workspace.create.request', req, { timeoutMs: Math.max(deadline - Date.now(), 1000) })
     const d = res?.workspace
     if (!d?.id) throw new RpcError(`Paseo did not create the worktree: ${res?.error || 'no reason given'}`, res?.errorCode || 'create_failed')
     // Its answer has no placement yet; the update Paseo sends of it (or sent already) is kept over it.
@@ -2231,7 +2285,7 @@ export function createPaseoBridge(deps = {}, options = {}) {
       }
     }
     const prompt = typeof params.prompt === 'string' ? params.prompt : ''
-    const workspaceId = workspaceFor(params.workspace_id, cwd, { strict: true })
+    let workspaceId = workspaceFor(params.workspace_id, cwd, { strict: true })
     // The Persona session is fixed for this start: the id the hub named for it (session_id: the manager names the
     // sessions it starts, to find one whose answer it lost), else paseo-<the first Paseo agent id>. The row handed to
     // the node while Paseo is still creating, the label, the tools' PERSONA_SESSION_ID and the listed session are all
@@ -2245,13 +2299,14 @@ export function createPaseoBridge(deps = {}, options = {}) {
     // request has an idempotency key of its own, the same each time it is asked: Paseo's creation service keeps a
     // request by its key across connections, so one asked again after a reconnect (repeat) gets the agent Paseo made
     // for it, or waits for the one it is still making, never a second agent.
-    const attempt = (withTools, withPolicy) => {
-      const mcpServers = withTools ? personaMcpServers(options.mcpConfig, sessionId, log) : undefined
+    const attempt = async (withTools, withPolicy) => {
+      const a2aToken = withTools ? await rt.a2aMcpToken(sessionId).catch(() => undefined) : undefined
+      const mcpServers = withTools ? personaMcpServers(options.mcpConfig, sessionId, log, a2aToken) : undefined
       const req = { agentId, idempotencyKey: `persona:${sessionId}:${++tries}`, config: mcpServers ? { ...config, mcpServers } : config,
         labels: { [SESSION_LABEL]: sessionId } }
       const policy = mcpServers && withPolicy && root === 'claude' ? preapproved(mcpServers) : undefined
       if (policy) req.config.toolPolicy = policy
-      if (prompt.trim()) req.initialPrompt = prompt
+      if (prompt.trim() && !params.backend_workspace_root) req.initialPrompt = prompt
       if (workspaceId) req.workspaceId = workspaceId
       // Paseo answers once the agent's provider is up, which has no bound of its own: the start gives up at until.
       const ask = () => paseo.request('agent.create.request', req, { timeoutMs: Math.max(until - Date.now(), 1000) })
@@ -2261,7 +2316,29 @@ export function createPaseoBridge(deps = {}, options = {}) {
     // A provider that takes no MCP servers fails the creation outright (Paseo closes that session before it has an
     // agent): it gets the agent as it did before the Persona tools, in one more request, and for that error only. One
     // that cannot preapprove them gets them without, asking as before (allowOwn answers those asks).
-    const created = attempt(true, true).then(({ res, withTools, policy }) => {
+    const created = (async () => {
+      if (!workspaceId) {
+        const projectId = await projectAt(cwd)
+        if (projectId) {
+          // agent.create has no projectId field. Create the directory workspace with explicit ownership, then start
+          // in it. Keep this inside the start's existing wait/late-result flow, with one key across reconnects.
+          const req = { source: { kind: 'directory', path: cwd, projectId }, idempotencyKey: `persona:workspace:${sessionId}` }
+          const made = await repeat(`creating workspace for ${sessionId}`,
+            () => paseo.request('workspace.create.request', req, { timeoutMs: Math.max(until - Date.now(), 1000) }), until, () => undefined)
+          const d = made?.workspace
+          if (params.backend_workspace_root && (!d?.id || d.projectId !== projectId || !samePath(d.workspaceDirectory, cwd))) {
+            throw new RpcError('Paseo could not open the prepared task directory', 'backend_workspace_start_refused')
+          }
+          if (!d?.id || d.projectId !== projectId) {
+            throw new RpcError(`Paseo did not create the workspace in the selected project: ${made?.error || 'no matching workspace returned'}`, 'create_failed')
+          }
+          if (!workspaces.get(d.id)?.project) keepWorkspace(d)
+          workspaceId = d.id
+          scheduleWorkspaces(0)
+        }
+      }
+      return attempt(true, true)
+    })().then(({ res, withTools, policy }) => {
       if (!withTools || res?.agent) return res
       if (policy && POLICY_UNSUPPORTED.test(res?.error ?? '')) {
         log(`paseo: provider ${provider} cannot preapprove the Agent's own tools; creating the agent again without that`)
@@ -2291,7 +2368,7 @@ export function createPaseoBridge(deps = {}, options = {}) {
       ...(EFFORTS.includes(config.thinkingOptionId) ? { effort: config.thinkingOptionId } : {}),
     })
     const said = Object.keys(instead).length ? { instead } : {}
-    const res = await within(created, callWait)
+    const res = params.backend_workspace_root ? await created : await within(created, callWait)
     if (res === TIMEOUT) {
       // Still being created (its provider starting, Paseo restarting): listed as starting until Paseo is done (track).
       // Then the agent's row takes over, or this one says why it did not start.
@@ -2309,6 +2386,14 @@ export function createPaseoBridge(deps = {}, options = {}) {
     }
     upsert(res.agent)
     const row = rowOf(res.agent)
+    if (params.backend_workspace_root) {
+      if (!row || !samePath(res.agent.cwd, cwd) || !samePath(row.cwd, cwd)) {
+        throw new RpcError('Paseo returned an agent outside the prepared task directory', 'backend_workspace_cwd_mismatch')
+      }
+      if (prompt.trim()) {
+        await deliverMessage({ session_id: row.session_id, text: prompt, client_msg_id: `workspace-start:${sessionId}` }, startGiveUp)
+      }
+    }
     // The effort it runs at, while Paseo's record does not say it yet.
     if (row && !row.effort && config.thinkingOptionId && EFFORTS.includes(config.thinkingOptionId)) row.effort = config.thinkingOptionId
     return { session: row ?? placeholder(), ...said }

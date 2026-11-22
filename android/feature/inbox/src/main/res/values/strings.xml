@@ -94,10 +94,25 @@
     <string name="inbox_empty_filtered_title">Nothing open matches these filters</string>
     <string name="inbox_empty_filtered_text">Clear the filters to see the whole Inbox.</string>
     <string name="inbox_empty_caught_up_title">All caught up</string>
-    <string name="inbox_empty_caught_up_text">Nothing under this filter.</string>
+    <string name="inbox_empty_caught_up_text">New messages and mail will show up here.</string>
+    <string name="inbox_grouping_title">Group by</string>
+    <string name="inbox_empty_action_title">Nothing needs you</string>
+    <string name="inbox_empty_working_title">Nothing in progress</string>
+    <string name="inbox_empty_fyi_title">Nothing to read</string>
+    <string name="inbox_empty_done_title">Nothing done yet</string>
+    <string name="inbox_empty_section_text">The rest are in the other sections above.</string>
+    <string name="inbox_empty_done_text">What you mark done shows up here.</string>
     <string name="inbox_group_fyi">FYI</string>
     <string name="inbox_mark_all_seen">Mark all seen</string>
     <string name="inbox_clear_all">Clear all</string>
+    <plurals name="inbox_mark_all_in_seen">
+        <item quantity="one">Mark %1$d item in “%2$s” seen</item>
+        <item quantity="other">Mark all %1$d in “%2$s” seen</item>
+    </plurals>
+    <plurals name="inbox_clear_all_in">
+        <item quantity="one">Clear %1$d item in “%2$s”</item>
+        <item quantity="other">Clear all %1$d in “%2$s”</item>
+    </plurals>
     <string name="inbox_translated">Translated</string>
     <plurals name="inbox_messages_count">
         <item quantity="one">%1$d message</item>

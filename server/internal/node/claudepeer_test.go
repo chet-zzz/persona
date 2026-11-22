@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/nodeproto"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -34,9 +35,9 @@ func TestOutsideClaudeListedLive(t *testing.T) {
 			s.LastText != "on it" || s.ReadOnlyReason != "" {
 			t.Errorf("%s: %+v", c.entrypoint, s)
 		}
-		// Busy: the phone's Stop cuts its turn through the inbox (interruptOutside).
+		// Busy: the phone's Stop cuts its turn through the inbox (interruptOutside). With no pane, no queue controls (#12789).
 		if cp := s.Capabilities; cp == nil || !cp.Read || !cp.Send || !cp.Interrupt || cp.Approve || cp.Terminal || cp.Attach ||
-			cp.Modes == nil || *cp.Modes {
+			cp.Modes == nil || *cp.Modes || cp.QueueEdit == nil || *cp.QueueEdit || cp.QueueSendNow == nil || *cp.QueueSendNow {
 			t.Errorf("%s capabilities = %+v", c.entrypoint, cp)
 		}
 	}
@@ -71,6 +72,28 @@ func TestOutsideClaudeListedLive(t *testing.T) {
 	writeClaudeProc(t, home, 999999, map[string]any{"sessionId": sidA, "cwd": home, "kind": "interactive", "entrypoint": "cli", "status": "busy"})
 	if s, ok := byID(listSessions(t, n))[sidA]; ok && s.Status != proto.StatusOffline {
 		t.Errorf("exited claude listed live: %+v", s)
+	}
+}
+
+// Claude Code's queue edit and send-now are keys on its own screen: for a session the desktop app has open (no pane)
+// a call that comes anyway is refused with its reason rather than failing as not running, which the hub answers with
+// 502 (#12789). A session no claude has open still fails as before.
+func TestOutsideClaudeQueueCallsWithoutPane(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	p := bgTranscript(t, home, home, sidA, "plan the release")
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	writeOutsideClaude(t, home, sidA, "claude-desktop", "busy", newFakeInbox(t, p), nil)
+
+	ctx := context.Background()
+	if err := n.sendQueuedNow(ctx, sidA); codeOf(err) != "send_now_unsupported" {
+		t.Errorf("send now: %v", err)
+	}
+	if _, err := n.editQueue(ctx, sidA, []int{0}); codeOf(err) != "queue_edit_unsupported" {
+		t.Errorf("edit: %v", err)
+	}
+	if err := n.sendQueuedNow(ctx, sidB); err == nil || codeOf(err) != "" {
+		t.Errorf("a session no claude has open: %v", err)
 	}
 }
 
@@ -276,9 +299,13 @@ func TestOutsideClaudeStatesBypassOnlyForTheOwner(t *testing.T) {
 		}
 	}
 	writeOutsideClaude(t, home, sidA, "claude-desktop", "busy", inbox, nil)
-	_, _ = request(t, n, "session.interrupt", map[string]any{"session_id": sidA})
-	if h := envelopeHead(t, inbox, 6); h != bare {
-		t.Errorf("a Stop stated a class: %q", h)
+	_, err := request(t, n, "session.interrupt", map[string]any{"session_id": sidA, "owner_input": true})
+	if h := envelopeHead(t, inbox, 6); h != bare || refusalCode(err) != peerHeld {
+		t.Errorf("unmarked Stop: %q, %v", h, err)
+	}
+	_, err = request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA})
+	if h := envelopeHead(t, inbox, 7); h != owner || err != nil {
+		t.Errorf("owner Stop: %q, %v", h, err)
 	}
 
 	for _, mode := range []string{"default", "acceptEdits", "auto", "plan"} {
@@ -563,5 +590,22 @@ func TestOutsideClaudeModesRefused(t *testing.T) {
 	_ = os.Remove(filepath.Join(home, ".claude", "sessions", strconv.Itoa(os.Getpid())+".json"))
 	if _, err := request(t, n, "session.modes", map[string]any{"session_id": sidA, "permission_mode": "plan"}); !isRefusal(err, proto.CodeModesNotRunning) {
 		t.Errorf("not running: %v", err)
+	}
+}
+
+func TestOwnerInputExactRejectsDuplicateKeys(t *testing.T) {
+	for _, params := range []string{
+		`{"owner_input":true,"owner_input":true}`,
+		`{"owner_input":false,"owner_input":true}`,
+		`{"owner_input":false,"owner\u005finput":true}`,
+		`{"OWNER_INPUT":false,"owner_input":true}`,
+		`{"owner_input":true}{}`,
+	} {
+		if ownerInputExact(json.RawMessage(params)) {
+			t.Errorf("accepted invalid owner mark: %s", params)
+		}
+	}
+	if !ownerInputExact(json.RawMessage(`{"owner_input":true,"nested":{"owner_input":false}}`)) {
+		t.Error("a nested key counted as a top-level owner mark")
 	}
 }

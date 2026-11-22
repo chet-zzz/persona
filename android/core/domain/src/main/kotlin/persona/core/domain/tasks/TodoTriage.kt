@@ -7,6 +7,7 @@ import persona.core.contracts.SessionKey
 import persona.core.contracts.Todo
 import persona.core.contracts.TodoAsk
 import persona.core.contracts.parseTime
+import persona.core.domain.lines.ApiErrorInfo
 
 // The To-dos page's sections (#3156, #3206, docs/assistant/todo-status-sop.md): each to-do's place comes from real signals
 // only — its agents' sessions (alive, running, asking), its PR / delivery state, the latest task_review verdict and when it
@@ -55,6 +56,7 @@ fun Todo.triageStatus(lookup: (SessionKey) -> Session?, now: Long = System.curre
     var limit = false
     var unread = false
     var working = false
+    var waiting = false
     for (a in active) {
         if (!a.startError.isNullOrEmpty()) continue // a failed start counts as stopped
         val s = lookup(a.key)
@@ -62,13 +64,16 @@ fun Todo.triageStatus(lookup: (SessionKey) -> Session?, now: Long = System.curre
         if (st == AgentState.NeedsYou) return TriageStatus.NeedsYou
         when {
             s?.isUsageLimited(now) == true -> limit = true
+            s?.interrupted == true && (s.turnErrorKind == "unrecoverable" || s.turnErrorCode == "compaction_sealed" ||
+                ApiErrorInfo.unrecoverable(s.turnError)) -> interrupted = true
+            st == AgentState.Working || s?.starting == true -> working = true
+            active.size > 1 && s?.waitsWithoutBackground() == true -> waiting = true
             s?.interrupted == true -> interrupted = true
             st == AgentState.Unread -> unread = true
-            st == AgentState.Working || s?.starting == true -> working = true
         }
     }
     return when {
-        interrupted -> TriageStatus.Interrupted
+        interrupted && !working && !waiting && supervision?.state != "parked" -> TriageStatus.Interrupted
         limit -> TriageStatus.UsageLimit
         unread -> TriageStatus.Unread
         working -> TriageStatus.Working
@@ -162,7 +167,10 @@ fun Todo.triage(
         return at(TriageSection.Done, TriageRule.FailedStart)
     }
     if (status == TriageStatus.NeedsYou || status == TriageStatus.Interrupted) return at(TriageSection.Waiting, TriageRule.AgentAsks)
-    if (!isDone && (review == "needs_user" || ask?.outcome == "decide" || ask?.outcome == "cannot")) return at(TriageSection.Waiting, TriageRule.OwnerDecides)
+    if (!isDone && (review == "user_check" || hold?.unblock == HoldUnblock.User ||
+            review == "needs_user" || ask?.outcome == "decide" || ask?.outcome == "cannot")) {
+        return at(TriageSection.Waiting, TriageRule.OwnerDecides)
+    }
     if (status == TriageStatus.Working) return at(TriageSection.Working, TriageRule.AgentRunning)
     if (isDone) return at(if (fresh(ms(doneAt))) TriageSection.JustDone else TriageSection.Done, TriageRule.Closed)
     if (!concern && acceptanceStands) return at(if (fresh(ms(supervision?.latestReview?.at))) TriageSection.JustDone else TriageSection.Done, TriageRule.Accepted)
@@ -186,6 +194,20 @@ fun Todo.countsAsOpen(t: Triage): Boolean {
     if (t.rule == TriageRule.FailedStart) return t.section == TriageSection.Waiting
     if (isDone || t.section == TriageSection.Shelved || t.section == TriageSection.Done) return false
     return t.rule != TriageRule.Accepted && t.rule != TriageRule.Deployed
+}
+
+/**
+ * When a to-do the triage filed with the finished ones (Just finished or Done) finished, epoch ms: the moment its rule
+ * reads in [triage] — its close, its accepting review, its deploy — else its last move (a finished turn the owner has
+ * seen since). The Assistant's Finished entry lists what finished less than [JUST_DONE_MS] ago, seen or not (#10922; web
+ * `finishedAt`). 0 when nothing says.
+ */
+fun Todo.finishedAt(t: Triage): Long = when (t.rule) {
+    TriageRule.Closed -> ms(doneAt)
+    TriageRule.Accepted -> ms(supervision?.latestReview?.at)
+    TriageRule.Deployed -> ms(delivery?.at).takeIf { it > 0 } ?: t.last
+    TriageRule.Superseded -> ms(doneAt).takeIf { it > 0 } ?: t.last
+    else -> t.last
 }
 
 /** Where a to-do stands for every count of open work (#3331): open counts, shelved folds, closed is finished. */
@@ -231,7 +253,9 @@ private val TITLE_NOISE = Regex("[\\s\\p{P}\\p{S}]+")
  */
 fun Todo.relatedKeys(): List<String> {
     val keys = mutableListOf<String>()
-    val pr = prUrl.orEmpty().trim().replace(Regex("[#?].*$"), "").trimEnd('/').lowercase()
+    val rawPr = prUrl.orEmpty().trim()
+    val cut = rawPr.indexOfFirst { it == '#' || it == '?' }
+    val pr = (if (cut >= 0) rawPr.substring(0, cut) else rawPr).trimEnd('/').lowercase()
     if (pr.isNotEmpty()) keys += "pr:$pr"
     ISSUE_REF.find(title)?.let { keys += "issue:" + it.groupValues[1] }
     val t = title.lowercase().replace(TITLE_NOISE, "")
@@ -318,6 +342,8 @@ fun relatedRoots(list: List<Todo>): Map<String, String> {
  * assistant's entries alike (the web's `supersededFailedStarts`).
  */
 fun supersededFailedStarts(todos: List<Todo>): Set<String> {
+    if (todos.none { !it.startError.isNullOrEmpty() }) return emptySet()
+    if (todos.none { it.isDone && it.startError.isNullOrEmpty() }) return emptySet()
     val roots = relatedRoots(todos)
     val finished = todos.filter { it.isDone && it.startError.isNullOrEmpty() }.mapTo(HashSet()) { roots.getValue(it.id) }
     return todos.filter { !it.startError.isNullOrEmpty() && roots.getValue(it.id) in finished }.mapTo(HashSet()) { it.id }

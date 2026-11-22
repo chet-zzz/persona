@@ -70,9 +70,12 @@ private class AgentsOverlayScene(
         val detail = entries.last().takeIf { entries.size > 1 }
         // A row pick, including a new detail on the same list, closes only the overlaid column.
         LaunchedEffect(detail?.contentKey) { shown.value = false }
+        // The Agents list drags like iOS when `listKey != nil` (`SplitNavigation.swift:237`). A pushed detail keeps
+        // the edge (`SplitColumnControl.swift:160-169`); `entries.size <= 2` is the list plus its root detail.
         JSidebarColumn(sidebar = { entries.first().Content() }, width = PaneSplits.DefaultLeft.dp,
             pageStart = PaneSplits.DefaultLeft.dp, shown = shown.value, overlay = true,
-            onDismiss = { shown.value = false }, insetSidebar = false) {
+            onDismiss = { shown.value = false }, insetSidebar = false, drags = true,
+            detailAtRoot = entries.size <= 2, onDragSettle = { shown.value = it }) {
             CompositionLocalProvider(
                 LocalSplitDetail provides SplitDetailContext(
                     isFirstPage = entries.size == 2,
@@ -91,9 +94,9 @@ private class AgentsOverlayScene(
 
 /** The unselected page also stays full width under a narrow regular window's floating list, as on iOS. */
 @Composable
-internal fun AgentsEmptyPage(onShowList: () -> Unit) {
+internal fun AgentsEmptyPage(onShowList: (() -> Unit)?) {
     JPage(stringResource(R.string.app_tab_agents), actions = {
-        JIconButton(PersonaIcons.sidebar, stringResource(R.string.app_show_list), onShowList)
+        if (onShowList != null) JIconButton(PersonaIcons.sidebar, stringResource(R.string.app_show_list), onShowList)
     }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             DetailPlaceholder(stringResource(R.string.app_pane_agents_title), stringResource(R.string.app_pane_agents_detail), PersonaIcons.agentChat)

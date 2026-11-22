@@ -34,6 +34,10 @@ type Launcher struct {
 	PermissionModes PermissionModeSet `json:"permission_modes,omitempty"`
 	// Assistant: a runtime's launcher that may run the Persona assistant (docs/integrations/runtimes.md "Assistant"), whatever its agent.
 	Assistant bool `json:"assistant,omitempty"`
+	// SupervisionPolicy is an explicitly verified runtime instruction channel, independent of Assistant.
+	SupervisionPolicy bool `json:"supervision_policy,omitempty"`
+	// External is a sanitized, machine-local adapter advertisement. It grants no execution authority.
+	External *ExternalLauncher `json:"external,omitempty"`
 	// AssistantFor: on an Assistant launcher, the Agent launcher of this computer it runs the assistant for, as the
 	// runtime declares it (the person who set it up says it is the same agent and account): integrations/grok's
 	// grok-chat for the Paseo provider grok, which only starts Agents. The main chat's picker points that one at it
@@ -51,6 +55,9 @@ type Launcher struct {
 	// Pi: a Persona-managed provider pi can use on this computer too (ManagedLauncher.PiAPI, docs/integrations/pi.md
 	// "Persona's model providers").
 	Pi bool `json:"pi,omitempty"`
+	// BuiltinCompanion: this runtime launcher is backed by the node's own built-in Antigravity companion (wrapping the
+	// local `agy` CLI), not an external runtime. Set only by the node when the verified built-in companion registers.
+	BuiltinCompanion bool `json:"builtin_companion,omitempty"`
 }
 
 // StartInstead is what a new session's start asked for and does not run with, as an engine runtime that runs only its
@@ -93,6 +100,9 @@ type LauncherCheck struct {
 	Answer string `json:"answer,omitempty"`
 	Millis int    `json:"millis"`
 	Error  string `json:"error,omitempty"`
+	// AssistantTurn: the check ran as the assistant runs a turn of conversation (launchers.check assistant_turn, a node
+	// with launcher_check_assistant_turn, Claude Code launchers only); absent, it was the plain check.
+	AssistantTurn bool `json:"assistant_turn,omitempty"`
 }
 
 // ClaudeAuthStatus is what a node's claude.auth_status found: `claude auth status --json` run as the launcher runs
@@ -139,6 +149,8 @@ type LauncherModels struct {
 	Models []AgentModel `json:"models"`
 	// Locked: why a model picked here would not reach the agent (the launcher fixes its own --model); empty: it would.
 	Locked string `json:"locked,omitempty"`
+	// SupportsStartModel: the node verified a new native omp session can take a model in this host.
+	SupportsStartModel bool `json:"supports_start_model,omitempty"`
 }
 
 // ModelPrice is the catalog's reference price in USD per one million tokens. It is display metadata, not a gateway quote.
@@ -158,6 +170,9 @@ type AgentModel struct {
 	Description string `json:"description,omitempty"`
 	// Resolved: the model an alias stands for with this launcher's settings (opus → its model id).
 	Resolved string `json:"resolved,omitempty"`
+	// ResolvedOffered: the gateway's own catalog also lists Resolved verbatim as a selectable ID.
+	// Absent when unknown. The node preserves this evidence on the alias row without adding a picker row.
+	ResolvedOffered bool `json:"resolved_offered,omitempty"`
 	// Default: what the agent runs when no model is given; picking it is the same as picking none.
 	Default bool `json:"default,omitempty"`
 	// Efforts: the thinking efforts it takes, weakest first; none: no effort setting.
@@ -171,6 +186,10 @@ type AgentModel struct {
 	Custom bool `json:"custom,omitempty"`
 	// Price is the built-in catalog's exact-entry reference price; nil when unknown or inherited from another model.
 	Price *ModelPrice `json:"price,omitempty"`
+	// Aliases: the other spellings the manager folded into this row because they run the same model with the same
+	// context window on this launcher (Claude Code's tier aliases on a gateway whose tiers name one model, #10365,
+	// assistant/models_launchers_fold.go). Each still picks this row: a saved pick of one keeps working.
+	Aliases []string `json:"aliases,omitempty"`
 }
 
 type LauncherEnv struct {
@@ -215,7 +234,7 @@ type ManagedLauncher struct {
 	// SubagentForce: CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 (the subagent model wins over an agent's own model:).
 	SubagentForce bool `json:"subagent_force,omitempty"`
 	// Headers: ANTHROPIC_CUSTOM_HEADERS, one "Name: value" a line. A secret like the key: sealed at rest, never sent
-	// back to clients (they see HasHeaders).
+	// back to clients (they see HasHeaders and, in the manager's LauncherView, only the configured names).
 	Headers    string `json:"headers,omitempty"`
 	HasHeaders bool   `json:"has_headers,omitempty"`
 	// Proxy / NoProxy: HTTP_PROXY and HTTPS_PROXY / NO_PROXY for the gateway.
@@ -319,27 +338,6 @@ type ProviderModel struct {
 	Price *ModelPrice `json:"price,omitempty"`
 }
 
-// The assistant's runtimes for a Claude launcher (model_config.assistant's "runtime", the assistant.send / .start /
-// .warm params' "runtime"): the Claude Code CLI in stream-json mode (the default), or the Claude Agent SDK through the
-// node's Node bridge (integrations/agent-sdk, #2455), which falls back to the CLI where no Node 22+ is found.
-const (
-	AssistantRuntimeCLI      = "cli"
-	AssistantRuntimeAgentSDK = "agentsdk"
-)
-
-// Why an assistant conversation that asked for the Agent SDK runs on the CLI (Session.RuntimeFallback), as the node
-// writes it: in Chinese, the ones ending in a full-width colon followed by the cause, FallbackShellLauncher with the launcher's name.
-// The hub rewrites them in the app's language (hub/transcript_text.go runtimeFallbackText).
-const (
-	FallbackShellLauncher  = "启动器 %s 是这台电脑上的 shell 命令，Agent SDK 用不了它的设置"
-	FallbackReadBridge     = "读不到 Agent SDK 桥："
-	FallbackNoBridge       = "这个 personad 没有带 Agent SDK 桥"
-	FallbackWriteBridge    = "写不出 Agent SDK 桥："
-	FallbackNoBridgeScript = "Agent SDK 桥的包里没有 bridge.mjs"
-	FallbackNoNode         = "没有 Node.js 22 及以上："
-	FallbackNoClaude       = "找不到 claude："
-)
-
 // BearerAuth: the launcher's key goes as Authorization: Bearer (ANTHROPIC_AUTH_TOKEN) rather than x-api-key.
 func (l ManagedLauncher) BearerAuth() bool { return l.Auth == "bearer" }
 
@@ -349,6 +347,21 @@ func (l ManagedLauncher) AgentType() string {
 		return l.Agent
 	}
 	return "claude"
+}
+
+// CustomHeadersSupported reports whether this managed runtime has a real launch-time channel for every configured
+// header. A probe may send a header over HTTP even when the runtime cannot; those combinations must be refused instead
+// of presenting the probe as proof of a working launch.
+func (l ManagedLauncher) CustomHeadersSupported() bool {
+	switch l.AgentType() {
+	case "claude", "codex":
+		return true
+	case "omp":
+		// omp documents ANTHROPIC_CUSTOM_HEADERS for its Anthropic provider behind a non-Anthropic base URL.
+		return (l.API == "" || l.API == "messages") && !AnthropicAPI(l.LaunchBaseURL())
+	default:
+		return false
+	}
 }
 
 // PiAPI is the pi API (pi's registerProvider "api") a provider speaks when pi can use it too (docs/integrations/pi.md
@@ -385,12 +398,19 @@ func (l ManagedLauncher) MessagesBase() bool {
 	return l.API == "" || l.API == "messages"
 }
 
-// LaunchBaseURL is the Base URL as the provider's agent takes it: a Messages base through MessagesBaseURL, any other as
-// stored. The hub stores and delivers it, and the node launches with it, so a provider saved before the hub dropped a
-// trailing /v1 still reaches what Test connection called.
+// LaunchBaseURL is the Base URL as the provider's agent or direct API takes it: a Messages base through
+// MessagesBaseURL, a Chat Completions or Responses base through APIBaseURL, and any other as stored. The hub stores
+// and delivers it, and the node launches with it, so a provider saved before the hub dropped a trailing /v1 or pasted
+// endpoint path still reaches what Test connection called.
 func (l ManagedLauncher) LaunchBaseURL() string {
 	if l.MessagesBase() {
 		return MessagesBaseURL(l.BaseURL)
+	}
+	if l.AgentType() == "codex" {
+		return APIBaseURL(l.BaseURL, "responses")
+	}
+	if l.API == "chat" || l.API == "responses" {
+		return APIBaseURL(l.BaseURL, l.API)
 	}
 	return l.BaseURL
 }
@@ -405,27 +425,87 @@ func AnthropicAPI(base string) bool {
 	return err == nil && strings.EqualFold(u.Hostname(), AnthropicAPIHost)
 }
 
-// MessagesBaseURL is a gateway address as ANTHROPIC_BASE_URL takes it. Claude Code and the Anthropic SDKs add
-// /v1/messages themselves, so the /v1 many gateways put at the end of their documented address would make
-// /v1/v1/messages: the /v1 ending the path goes with any trailing slashes, a deployment prefix before it stays
-// ("https://gw/prefix/v1/" → "https://gw/prefix"). It is idempotent (a run of /v1 goes whole): the hub stores its
-// result and the node applies it again at launch, and both must reach what Test connection called. Anything else (no
-// host, a query) is only trimmed.
+// APIBaseURL normalizes a gateway Base URL for api ("messages"/empty, "responses", or "chat"), stripping a pasted
+// trailing endpoint path while keeping /v1 on OpenAI-compatible bases ("https://host/v1/v1/chat/completions" →
+// "https://host/v1/v1") and preserving bare /responses deployment prefixes ("https://gw/responses" stays unchanged;
+// "https://gw/v1/responses" → "https://gw/v1").
+func APIBaseURL(base, api string) string {
+	switch api {
+	case "", "messages":
+		return MessagesBaseURL(base)
+	case "chat":
+		return trimSinglePathSuffix(base, "/chat/completions")
+	case "responses":
+		return trimVersionedEndpointSuffix(base, "/responses")
+	default:
+		return strings.TrimRight(strings.TrimSpace(base), "/")
+	}
+}
+
+// MessagesBaseURL is a gateway address as ANTHROPIC_BASE_URL takes it. Unlike APIBaseURL for "chat" and "responses",
+// MessagesBaseURL produces an ANTHROPIC_BASE_URL without a trailing /v1: Claude Code (node/launcherenv.go) and
+// connection probes (assistant/models_probe.go) unconditionally append /v1/messages themselves, and saving plus
+// launch-time re-application require strict idempotence (MessagesBaseURL(got) == got; a run of /v1 goes whole).
+//
+// Normalization runs in two ordered phases: first strip a pasted /v1/messages endpoint suffix (only /messages
+// preceded by /v1, never a /messages deployment prefix), then strip any trailing /v1 segments so
+// "https://gw/prefix/v1/" → "https://gw/prefix" and both "https://gw/messages/v1" and
+// "https://gw/messages/v1/messages" → "https://gw/messages". Anything else (no host, a query) is only trimmed.
 func MessagesBaseURL(base string) string {
+	return trimBasePathSuffix(trimVersionedEndpointSuffix(base, "/messages"), "/v1")
+}
+
+func splitBaseURLPath(base string) (root, path string, ok bool) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
-		return base
+		return base, "", false
 	}
 	authority := strings.Index(base, "//") + len("//")
 	slash := strings.IndexByte(base[authority:], '/')
 	if slash < 0 {
-		return base // no path
+		return base, "", false // no path
 	}
-	root, path := base[:authority+slash], base[authority+slash:]
+	return base[:authority+slash], base[authority+slash:], true
+}
+
+// trimVersionedEndpointSuffix drops a single pasted /v1<suffix> endpoint (e.g. /v1/messages or /v1/responses) while
+// keeping the preceding /v1 and leaving bare deployment prefixes ("https://gw/messages", "https://gw/responses") intact.
+func trimVersionedEndpointSuffix(base, suffix string) string {
+	root, path, ok := splitBaseURLPath(base)
+	if !ok {
+		return root
+	}
+	rest, found := strings.CutSuffix(path, suffix)
+	if !found {
+		return root + path
+	}
+	rest = strings.TrimRight(rest, "/")
+	if !strings.HasSuffix(rest, "/v1") {
+		return root + path
+	}
+	return root + rest
+}
+
+func trimSinglePathSuffix(base, suffix string) string {
+	root, path, ok := splitBaseURLPath(base)
+	if !ok {
+		return root
+	}
+	if rest, found := strings.CutSuffix(path, suffix); found {
+		return root + strings.TrimRight(rest, "/")
+	}
+	return root + path
+}
+
+func trimBasePathSuffix(base, suffix string) string {
+	root, path, ok := splitBaseURLPath(base)
+	if !ok {
+		return root
+	}
 	for {
-		rest, ok := strings.CutSuffix(path, "/v1")
-		if !ok {
+		rest, found := strings.CutSuffix(path, suffix)
+		if !found {
 			return root + path
 		}
 		path = strings.TrimRight(rest, "/")

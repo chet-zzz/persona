@@ -163,7 +163,7 @@ func TestGoldenMainHandoff(t *testing.T) {
 }
 
 // The CLAUDE.md asks for the user's language (docs/protocol/i18n.md); zh-Hans, or a hub that says none, keeps it as it was.
-func TestAssistantClaudeMDLanguage(t *testing.T) {
+func TestGoldenAssistantClaudeMDLanguage(t *testing.T) {
 	ctx := context.Background()
 	f := claudeMDHub(Device{ID: "server", Name: "服务器", Kind: "local"})
 	s := newTestService(t, f)
@@ -181,6 +181,28 @@ func TestAssistantClaudeMDLanguage(t *testing.T) {
 		got := s.claudeMD(ctx, "server", false)
 		if !strings.Contains(got, want) || strings.Contains(got, "；用中文。") {
 			t.Fatalf("%s: no %q", locale, want)
+		}
+		// The header contains both the response language and the relay acknowledgement rule.
+		header, _, _ := strings.Cut(got, "\n## ")
+		golden(t, "assistant_relay_instructions."+locale, strings.TrimSpace(header))
+	}
+}
+
+// Content the user must read completely belongs in the final response in every locale and in the health space:
+// progress notes between tool calls may reach the client only as summaries.
+func TestAssistantClaudeMDFinalResponseCompleteness(t *testing.T) {
+	ctx := context.Background()
+	f := claudeMDHub(Device{ID: "server", Name: "服务器", Kind: "local"})
+	s := newTestService(t, f)
+	s.kb.dir = "<hub>/data"
+	const rule = "需要用户完整读到的决定确认、清单、数字、代码或长段内容，放在本轮最后的正式回复里，不要只写在工具调用之间的进度说明里。"
+	for _, locale := range []string{"", "zh-Hans", "en", "ja"} {
+		f.hello.Locale = locale
+		if got := s.claudeMD(ctx, "server", false); !strings.Contains(got, rule) {
+			t.Errorf("locale %q: no final-response completeness rule", locale)
+		}
+		if got := s.healthClaudeMD(ctx, "server"); !strings.Contains(got, rule) {
+			t.Errorf("health locale %q: no final-response completeness rule", locale)
 		}
 	}
 }

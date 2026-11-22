@@ -14,10 +14,15 @@ final class DevMode {
     static let shared = DevMode()
     static let onKey = "devMode.on"
     static let sinceKey = "devMode.since"
+    static let callHandleKey = "devMode.callHandle"
 
     private(set) var isOn: Bool
     /// When the switch was turned on.
     private(set) var since: Date?
+    /// Call handle (#9887): the kind of handle a call to Persona carries to the system, an on-device experiment for
+    /// Phone › Recents, which only a device shows. Read once at launch; it counts only while the switch is on
+    /// (`callHandleInUse`).
+    private(set) var callHandle: CallHandleKind
     /// The bytes recorded, read by `refresh` (off the main actor).
     private(set) var size: Int64?
 
@@ -33,15 +38,26 @@ final class DevMode {
     init(recorder: DevRecorder = .shared, defaults: UserDefaults = .standard) {
         self.recorder = recorder
         self.defaults = defaults
-        isOn = defaults.bool(forKey: Self.onKey)
-        since = isOn ? defaults.object(forKey: Self.sinceKey) as? Date : nil
+        let on = defaults.bool(forKey: Self.onKey)
+        isOn = on
+        since = on ? defaults.object(forKey: Self.sinceKey) as? Date : nil
+        callHandle = defaults.string(forKey: Self.callHandleKey).flatMap(CallHandleKind.init(rawValue:)) ?? .generic
+    }
+
+    /// The handle kind a new call carries: the switch's while Developing Persona is on, else the generic one.
+    var callHandleInUse: CallHandleKind { isOn ? callHandle : .generic }
+
+    func setCallHandle(_ kind: CallHandleKind) {
+        guard kind != callHandle else { return }
+        callHandle = kind
+        defaults.set(kind.rawValue, forKey: Self.callHandleKey)
     }
 
     /// At launch: carries on recording when the switch was left on.
     func launch(tab: AppTab) {
         self.tab = Self.name(tab)
         guard isOn else { return }
-        begin(active: Self.inFront)
+        begin(active: Self.inFront, fresh: true)
     }
 
     func setOn(_ on: Bool) {
@@ -53,7 +69,7 @@ final class DevMode {
             since = now
             defaults.set(now, forKey: Self.sinceKey)
             size = nil
-            begin(active: Self.inFront)
+            begin(active: Self.inFront, fresh: false)
         } else {
             end()
             since = nil
@@ -61,6 +77,10 @@ final class DevMode {
             defaults.removeObject(forKey: Self.sinceKey)
             let store = recorder.store
             recorder.afterWrites { store.clear() }
+            #if os(iOS)
+            // The meeting tapes kept for replays (#10589) go with it: they hold other people's words.
+            MeetingTapeLibrary.shared.deleteAll()
+            #endif
         }
     }
 
@@ -127,12 +147,14 @@ final class DevMode {
 
     // MARK: Recording
 
-    private func begin(active: Bool) {
+    /// `fresh`: at launch, so the connection tally counts the period in front from its start (#11390); turned on by
+    /// hand, it starts with the next one.
+    private func begin(active: Bool, fresh: Bool) {
         let recorder = recorder
         #if os(iOS)
         UIDevice.current.isBatteryMonitoringEnabled = true
         #endif
-        recorder.start(active: active, page: current, device: device())
+        recorder.start(active: active, page: current, device: device(), fresh: fresh)
         DevProbe.install(recorder)
         HubRedirects.finished = { @Sendable task, metrics in recorder.request(task, metrics) }
         Task.detached(priority: .utility) { DevMetrics.shared.start() }
@@ -242,4 +264,10 @@ final class DevMode {
         true
         #endif
     }
+}
+
+/// The kinds of handle a call to Persona can carry (`CallHandle`; Developing Persona's Call handle, #9887): the
+/// assistant's name as a generic handle (the default), or a fixed placeholder email address.
+nonisolated enum CallHandleKind: String, CaseIterable, Equatable, Sendable {
+    case generic, email
 }

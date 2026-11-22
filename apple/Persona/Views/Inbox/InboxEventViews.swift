@@ -594,7 +594,7 @@ struct InboxSuggestionEditor: View {
             .navigationTitle(InboxEventText.kindTitle(suggestion))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                SheetClose { dismiss() }
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
                         let changed = text
@@ -710,7 +710,7 @@ struct InboxChainSection: View {
             .accessibilityIdentifier("inbox.chain")
             .task(id: CutChain(key: item.key, count: item.chainCount)) { await readWhole() }
             .sheet(item: $todo) { r in
-                NavigationStack { TodoDetailView(todoID: r.id).macSheetDone { todo = nil } }
+                NavigationStack { TodoDetailView(todoID: r.id).sheetDone { todo = nil } }
                 #if os(macOS)
                 .macSheet()
                 #endif
@@ -736,7 +736,7 @@ struct InboxChainSection: View {
             HStack(alignment: .firstTextBaseline, spacing: Theme.Space.s) {
                 tappable(e, target) { line(e, target: target, open: open, showsLiveState: showsLiveState) }
                 // An entry that goes somewhere and has messages too: they open here with the chevron.
-                if target.navigates && e.expandable {
+                if target.navigates && unfolds(e) {
                     Button { toggle(e) } label: {
                         ThemedIcon(open ? Theme.Icon.collapse : Theme.Icon.expand)
                             .font(Theme.Font.labelHeavy).foregroundStyle(.secondary)
@@ -751,6 +751,12 @@ struct InboxChainSection: View {
         }
         .padding(.vertical, Theme.Space.xs)
         .accessibilityValue(e.id)
+    }
+
+    /// Whether an entry that goes somewhere also unfolds its messages beside it. An assistant row's received message is the
+    /// text drawn in full above (#9041): its entry only goes to the conversation, one arrow (#9928).
+    private func unfolds(_ e: InboxItem.ChainEntry) -> Bool {
+        e.expandable && !(item.isAssistantRow && e.kind == "received")
     }
 
     private func line(_ e: InboxItem.ChainEntry, target: InboxChainTarget, open: Bool, showsLiveState: Bool) -> some View {
@@ -1021,7 +1027,7 @@ struct InboxSourcePage: View {
         case .document:
             InboxDocDetailView(item: item)
         case .connector:
-            InboxConnectorDetailView(item: item)
+            InboxConnectorDetailView(item: item, manager: model.itemManager(item.manager))
         case .moment:
             if let moment = item.moment {
                 LarkMomentsPostView(postID: moment.postID, pushed: true, manager: model.linkManager(item.manager))
@@ -1040,7 +1046,7 @@ struct InboxSourcePage: View {
     /// The mail the link names, else the thread's newest.
     private var mail: MailSummary? {
         guard let uid = route.uid, let m = item.mail else { return item.mailSummary }
-        return MailSummary(accountID: m.accountID, mailbox: m.mailbox, uid: uid, messageID: uid == m.uids.last ? m.messageID : nil,
+        return MailSummary(accountID: m.accountID, mailbox: m.sourceMailbox ?? "INBOX", uid: uid, messageID: uid == m.uids.last ? m.messageID : nil,
                            subject: item.title, from: m.from, date: item.updatedAt, snippet: item.preview, seen: true)
     }
 }

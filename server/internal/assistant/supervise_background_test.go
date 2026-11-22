@@ -91,7 +91,7 @@ func TestBackgroundSupervisorFollowsUpTheMainConversationsTasks(t *testing.T) {
 	if slices.Contains(cfg.Leaders, bg) || s.isLeader(ctx, bg) || s.supervises(ctx, bg) {
 		t.Fatal("the background supervisor is a leader")
 	}
-	if !slices.Contains(keptSessions(cfg, nil, nil), SessionRef{MachineID: "server", SessionID: bg}) {
+	if !slices.Contains(keptSessions(cfg, nil, nil, nil, nil, nil), SessionRef{MachineID: "server", SessionID: bg}) {
 		t.Fatal("the background supervisor is not kept listed")
 	}
 	if !s.supervising(bg) {
@@ -102,7 +102,7 @@ func TestBackgroundSupervisorFollowsUpTheMainConversationsTasks(t *testing.T) {
 	listBackground(t, s, f, bg)
 	waitFor(t, "the background supervisor's message", func() bool { return len(f.noticesTo(bg)) == 1 })
 	n := f.noticesTo(bg)[0]
-	for _, want := range []string{"📋 督办：你派出去的任务有 1 个要你处理", "这是 Persona 的督办消息", "你是后台督办对话", "signal=review", "hub 判断做完了，等你验收", "pull/7"} {
+	for _, want := range []string{"📋 督办：你派出去的任务有 1 个要你处理", "这是 Persona 的督办消息", "你是后台督办对话", "signal=review", "待逐项复核，不代表完成", "pull/7"} {
 		if !strings.Contains(n, want) {
 			t.Errorf("the background supervisor's message lacks %q:\n%s", want, n)
 		}
@@ -290,7 +290,7 @@ func TestMainSupervisesOwnTasksSetting(t *testing.T) {
 	agentTurn(s, f, proto.StatusWorking, "", 0)
 	agentTurn(s, f, proto.StatusDone, "做完了", 0)
 	waitFor(t, "the main conversation's message", func() bool { return len(f.noticesTo("conv1")) == 1 })
-	if n := f.noticesTo("conv1")[0]; strings.Contains(n, "后台督办") || !strings.Contains(n, "hub 判断做完了，等你验收") {
+	if n := f.noticesTo("conv1")[0]; strings.Contains(n, "后台督办") || !strings.Contains(n, "待逐项复核，不代表完成") {
 		t.Fatalf("the main conversation's message:\n%s", n)
 	}
 	if got := s.settings(ctx).BackgroundSupervisor; got != "" || len(conversationStarts(f)) != 0 {
@@ -338,7 +338,7 @@ func TestBackgroundSupervisorThatCannotStartFallsBackToMain(t *testing.T) {
 	agentTurn(s, f, proto.StatusWorking, "", 0)
 	agentTurn(s, f, proto.StatusDone, "做完了", 0)
 	waitFor(t, "the main conversation's message", func() bool { return len(f.noticesTo("conv1")) == 1 })
-	if n := f.noticesTo("conv1")[0]; !strings.Contains(n, "hub 判断做完了，等你验收") || strings.Contains(n, "你是后台督办对话") {
+	if n := f.noticesTo("conv1")[0]; !strings.Contains(n, "待逐项复核，不代表完成") || strings.Contains(n, "你是后台督办对话") {
 		t.Fatalf("the main conversation's message:\n%s", n)
 	}
 	if got := s.settings(ctx).BackgroundSupervisor; got != "" {
@@ -505,10 +505,10 @@ func TestAsksOfUnledTasksGoToTheBackgroundSupervisor(t *testing.T) {
 	if _, _, err := e.s.updateSupervision(ctx, e.todo.ID, func(v *Supervision) bool { v.Supervisor = "conv1"; return true }); err != nil {
 		t.Fatal(err)
 	}
-	if ladder, _, _, ok := e.s.askLadder(ctx, "mac", "worker-1"); !ok || !slices.Equal(ladder, []string{"bg1"}) {
+	if ladder, _, _, ok := e.s.askLadder(ctx, proto.Interaction{MachineID: "mac", SessionID: "worker-1", Kind: proto.IxQuestion}); !ok || !slices.Equal(ladder, []string{"bg1"}) {
 		t.Fatalf("ladder = %v %v", ladder, ok)
 	}
-	if _, _, _, ok := e.s.askLadder(ctx, "server", "bg1"); ok {
+	if _, _, _, ok := e.s.askLadder(ctx, proto.Interaction{MachineID: "server", SessionID: "bg1", Kind: proto.IxQuestion}); ok {
 		t.Fatal("the background supervisor's own cards are routed")
 	}
 
@@ -556,7 +556,7 @@ func TestAsksOfUnledTasksGoToTheBackgroundSupervisor(t *testing.T) {
 
 	on := true
 	setSettings(t, e.s, func(v *Settings) { v.MainSupervisesOwnTasks = &on })
-	if ladder, _, _, ok := e.s.askLadder(ctx, "mac", "worker-1"); !ok || !slices.Equal(ladder, []string{"conv1"}) {
+	if ladder, _, _, ok := e.s.askLadder(ctx, proto.Interaction{MachineID: "mac", SessionID: "worker-1", Kind: proto.IxQuestion}); !ok || !slices.Equal(ladder, []string{"conv1"}) {
 		t.Fatalf("with the setting off the ladder = %v %v", ladder, ok)
 	}
 }
@@ -566,7 +566,7 @@ func TestBackgroundSupervisorAloneDoesNotRouteAsks(t *testing.T) {
 	e := newRouteEnv(t, nil, false)
 	e.s.noBackground = false
 	setSettings(t, e.s, func(v *Settings) { v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg1", "server" })
-	if _, _, _, ok := e.s.askLadder(context.Background(), "mac", "worker-1"); ok {
+	if _, _, _, ok := e.s.askLadder(context.Background(), proto.Interaction{MachineID: "mac", SessionID: "worker-1", Kind: proto.IxQuestion}); ok {
 		t.Fatal("a card is routed with no leader conversation")
 	}
 	e.raise(askPermission("ix1", "worker-1"))
@@ -615,7 +615,7 @@ func TestBackgroundSupervisorModelPurpose(t *testing.T) {
 		t.Fatalf("catalog: %d %s", r.Code, r.Body.String())
 	}
 	listed := slices.DeleteFunc(slices.Clone(catalog.Purposes), func(p ModelPurpose) bool { return p.ID != purposeSupervise })
-	if len(listed) != 1 || catalog.Purposes[len(catalog.Purposes)-3].ID != purposeSupervise || catalog.Purposes[len(catalog.Purposes)-2].ID != purposeMeetingRoom {
+	if len(listed) != 1 || catalog.Purposes[len(catalog.Purposes)-4].ID != purposeSupervise || catalog.Purposes[len(catalog.Purposes)-3].ID != purposeMeetingRoom {
 		t.Fatalf("the catalog's rows for it: %+v", listed)
 	}
 	if own := purposeOf(t, s, purposeSupervise); !reflect.DeepEqual(listed[0], own) || own.Description == "" || own.Launch != "headless" {
@@ -682,7 +682,7 @@ func TestProviderUsesNameTheBackgroundSupervisor(t *testing.T) {
 	s, _, _ := modelService(t)
 	putLaunchers(t, s, storedLauncher{ManagedLauncher: proto.ManagedLauncher{Name: "shared"}}, storedLauncher{ManagedLauncher: proto.ManagedLauncher{Name: "supervise-only"}})
 	l := s.requestCtxLang(context.Background())
-	main, own, room := purposeName(l, "assistant"), purposeName(l, purposeSupervise), purposeName(l, purposeMeetingRoom)
+	main, own, room, mainOnly := purposeName(l, "assistant"), purposeName(l, purposeSupervise), purposeName(l, purposeMeetingRoom), purposeName(l, purposeMain)
 	uses := func(name string) []string {
 		t.Helper()
 		r := request(s, "GET", "/api/v1/launchers/"+name+"/uses", "")
@@ -702,12 +702,12 @@ func TestProviderUsesNameTheBackgroundSupervisor(t *testing.T) {
 		t.Fatalf("it does not follow the main chat: %+v", p)
 	}
 	// The In-meeting conversation follows the main chat as well (#7980).
-	if got := uses("shared"); !reflect.DeepEqual(got, []string{main, own, room}) || main == own {
-		t.Fatalf("uses while it follows the main chat: %v; want %q, %q and %q", got, main, own, room)
+	if got := uses("shared"); !reflect.DeepEqual(got, []string{main, own, room, mainOnly}) || main == own {
+		t.Fatalf("uses while it follows the main chat: %v; want %q, %q, %q and %q", got, main, own, room, mainOnly)
 	}
 	r := request(s, "DELETE", "/api/v1/launchers/shared", "")
 	sep := i18n.T(l, "assistant-models_launchers.list_sep")
-	want := i18n.T(l, "assistant-models_launchers.err_in_use", i18n.Args{"uses": main + sep + own + sep + room})
+	want := i18n.T(l, "assistant-models_launchers.err_in_use", i18n.Args{"uses": main + sep + own + sep + room + sep + mainOnly})
 	var refused struct {
 		Error string `json:"error"`
 	}
@@ -724,8 +724,8 @@ func TestProviderUsesNameTheBackgroundSupervisor(t *testing.T) {
 	if got := uses("supervise-only"); !reflect.DeepEqual(got, []string{own}) {
 		t.Fatalf("uses of its own provider: %v; want %q", got, own)
 	}
-	if got := uses("shared"); !reflect.DeepEqual(got, []string{main, room}) {
-		t.Fatalf("uses of the main chat's provider once it has its own: %v; want %q and %q", got, main, room)
+	if got := uses("shared"); !reflect.DeepEqual(got, []string{main, room, mainOnly}) {
+		t.Fatalf("uses of the main chat's provider once it has its own: %v; want %q, %q and %q", got, main, room, mainOnly)
 	}
 }
 
@@ -847,7 +847,8 @@ func TestOwnerPresenceAndTheBackgroundSupervisorsQueue(t *testing.T) {
 	agentTurn(s, f, proto.StatusDone, "做完了", 0)
 	bg := backgroundID(t, s)
 	listBackground(t, s, f, bg)
-	waitFor(t, "the background supervisor's message", func() bool { return len(f.noticesTo(bg)) == 1 })
+	// Until its drain is over, the delivered message is still at the head of the queue.
+	waitFor(t, "the background supervisor's message", func() bool { return len(f.noticesTo(bg)) == 1 && !drainingNow(s, bg) })
 	if _, present := s.ownersPresent(time.Now())[bg]; present {
 		t.Fatal("the owner counts as present in the background supervisor without having written there")
 	}
@@ -862,7 +863,9 @@ func TestOwnerPresenceAndTheBackgroundSupervisorsQueue(t *testing.T) {
 		t.Fatalf("while the owner writes there: %d queued, %d sent", n, f.sentTo(bg))
 	}
 	// Quiet again: one goes in per turn, and the one that waits on a decision goes before the one that came first.
-	waitFor(t, "the first held message once the owner is quiet", func() bool { return f.sentTo(bg) == 2 && s.queuedFor(bg) == 1 })
+	waitFor(t, "the first held message once the owner is quiet", func() bool {
+		return f.sentTo(bg) == 2 && s.queuedFor(bg) == 1 && !drainingNow(s, bg)
+	})
 	b := &s.relays
 	b.mu.Lock()
 	left := slices.Clone(b.st.Queue[bg])

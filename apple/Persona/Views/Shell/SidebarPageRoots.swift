@@ -27,6 +27,9 @@ enum SidebarPageRoot: Hashable {
             case .profile: .profile
             case .routines: .routines
             case .knowledge: .knowledge
+            #if os(iOS)
+            case .starred: .starred
+            #endif
             case .recordings: .recordings
             case .extensionPage(let r): .extensionPage(r)
             }
@@ -113,6 +116,9 @@ struct SidebarPageRoots {
 
     /// Whether a drill-down path is kept for `root` (tests).
     func keeps(_ root: SidebarPageRoot) -> Bool { saved[root] != nil }
+
+    /// Nothing for `forget` to do: the conversation in front, nothing kept.
+    var forgotten: Bool { current == .conversation && saved.isEmpty }
 }
 
 extension SidebarPageRoot {
@@ -127,6 +133,9 @@ extension SidebarPageRoot {
         case .profile: .page(ShellRoute.profile)
         case .routines: .page(ShellRoute.routines)
         case .knowledge: .page(ShellRoute.knowledge)
+        #if os(iOS)
+        case .starred: .page(ShellRoute.starred)
+        #endif
         case .recordings: .page(ShellRoute.recordings)
         case .extensionPage(let r): .page(ShellRoute.extensionPage(r))
         case .messages: .page(SidebarRoute.messages)

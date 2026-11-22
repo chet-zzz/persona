@@ -14,6 +14,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -64,6 +66,12 @@ val LocalChromeInsets = compositionLocalOf { ChromeInsets() }
 
 /** The leading control of root pages (the hub avatar that opens settings), supplied by the shell. */
 val LocalRootLeading = compositionLocalOf<(@Composable () -> Unit)?> { null }
+
+/**
+ * True when this entry is a sidebar place shown as the page root at regular width.
+ * [LocalRootLeading] is also set by Settings, Engine and Pairing for other reasons, so it is not this test.
+ */
+val LocalIsSidebarRoot = compositionLocalOf { false }
 
 /** Back for a root page the shell shows as a page of its own (settings outside the board style). */
 val LocalRootBack = compositionLocalOf<(() -> Unit)?> { null }
@@ -338,23 +346,30 @@ internal fun ScrollEdge(
     val density = LocalDensity.current
     val full = with(density) { edgeHeight.toPx() }
     val soft = with(density) { style.fade.toPx() }.coerceAtMost(full)
-    fun wash(strength: Float): Brush {
-        val solid = Color.Black.copy(alpha = strength)
-        val stop = (full - soft) / full
-        return if (top) Brush.verticalGradient(0f to solid, stop to solid, 1f to Color.Transparent)
+    val blurOn = style.blur && state != null && PersonaTheme.glass != GlassLevel.Solid
+    val washStrength = if (blurOn) 0.5f else 0.92f
+    val mask = remember(top, full, soft, washStrength) {
+        val solid = Color.Black.copy(alpha = washStrength)
+        val stop = if (full > 0f) (full - soft) / full else 0f
+        if (top) Brush.verticalGradient(0f to solid, stop to solid, 1f to Color.Transparent)
         else Brush.verticalGradient(0f to Color.Transparent, (1f - stop) to solid, 1f to solid)
     }
-    if (style.blur && state != null && PersonaTheme.glass != GlassLevel.Solid) {
-        Box(strip.hazeBlur(HazeInput.Sources(state), style = HazeBlurStyle {
-            blurRadius(18.dp)
-            noiseFactor(0f)
-            progressive(
-                if (top) HazeProgressive.verticalGradient(startY = full - soft, startIntensity = 1f, endY = full, endIntensity = 0f)
-                else HazeProgressive.verticalGradient(startY = 0f, startIntensity = 0f, endY = soft, endIntensity = 1f),
-            )
-        })) { AmbientLight(light, Modifier.matchParentSize(), inWindow = true, mask = wash(0.5f)) }
+    if (blurOn) {
+        val blurStyle = remember(top, full, soft) {
+            HazeBlurStyle {
+                blurRadius(18.dp)
+                noiseFactor(0f)
+                progressive(
+                    if (top) HazeProgressive.verticalGradient(startY = full - soft, startIntensity = 1f, endY = full, endIntensity = 0f)
+                    else HazeProgressive.verticalGradient(startY = 0f, startIntensity = 0f, endY = soft, endIntensity = 1f),
+                )
+            }
+        }
+        Box(strip.hazeBlur(HazeInput.Sources(state), style = blurStyle)) {
+            AmbientLight(light, Modifier.matchParentSize(), inWindow = true, mask = mask)
+        }
     } else {
-        Box(strip) { AmbientLight(light, Modifier.matchParentSize(), inWindow = true, mask = wash(0.92f)) }
+        Box(strip) { AmbientLight(light, Modifier.matchParentSize(), inWindow = true, mask = mask) }
     }
 }
 
@@ -414,7 +429,8 @@ fun JTopBar(
     onTitleClick: (() -> Unit)? = null,
     showTitle: Boolean = true,
 ) {
-    LocalHomeChrome.current?.takeIf { onBack == null }?.let { home ->
+    val home = LocalHomeChrome.current?.takeIf { onBack == null }
+    if (home?.showSwitch == true) {
         CompositionLocalProvider(LocalIconsRaised provides true) {
             HomeNavigation(home.items, home.selected, home.onSelect, home.leading,
                 modifier = home.barHeight?.let { height -> Modifier.onSizeChanged { height.intValue = it.height } } ?: Modifier,
@@ -425,13 +441,16 @@ fun JTopBar(
     val palette = PersonaTheme.palette
     val style = PersonaTheme.style
     val compactHeight = 56.dp
+    val barModifier = home?.barHeight?.let { height -> Modifier.onSizeChanged { height.intValue = it.height } } ?: Modifier
+    val rootLeading = LocalRootLeading.current
     val splitLeading = resolveDetailLeading(LocalSplitDetail.current, onBack)
     val leading: @Composable () -> Unit = {
-        when (splitLeading) {
+        if (home != null) home.leading()
+        else when (splitLeading) {
             is DetailLeading.ShowList -> JIconButton(persona.core.designsystem.icons.PersonaIcons.sidebar, stringResource(R.string.designsystem_sidebar), splitLeading.onClick)
             is DetailLeading.Back -> JBackButton(onClick = splitLeading.onClick)
             DetailLeading.Hidden -> Spacer(Modifier.width(if (style == AppStyle.Brief) Tokens.Space.s else Tokens.Space.sm))
-            null -> LocalRootLeading.current?.invoke()
+            null -> rootLeading?.invoke()
         }
     }
     val titleBlock: @Composable RowScope.() -> Unit = {
@@ -454,7 +473,7 @@ fun JTopBar(
     when (style) {
         AppStyle.Glass -> {
             val shape = RoundedCornerShape(30.dp.corner)
-            Box(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 10.dp.dense, vertical = 6.dp.dense)) {
+            Box(barModifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 10.dp.dense, vertical = 6.dp.dense)) {
                 Crossfade(showTitle, label = "bar") { full ->
                     if (full) Row(
                         Modifier.fillMaxWidth().height(60.dp).floatingSurface(shape).padding(horizontal = 6.dp.dense),
@@ -474,7 +493,7 @@ fun JTopBar(
         else -> Row(
             // Board keeps its summary beside the title here. Let their measured lines grow the bar; PageFrame uses
             // that same measured height to place the list and its pull-refresh content. Brief keeps its fixed bar.
-            Modifier.fillMaxWidth().background(palette.background).statusBarsPadding()
+            barModifier.fillMaxWidth().background(palette.background).statusBarsPadding()
                 .then(if (style == AppStyle.Board) Modifier.heightIn(min = compactHeight) else Modifier.height(compactHeight))
                 .padding(horizontal = 4.dp.dense),
             verticalAlignment = Alignment.CenterVertically,
@@ -520,10 +539,15 @@ fun JListPage(
     scrollEdgeStyle: ScrollEdgeStyle = ScrollEdgeStyle.Blurred,
     /** The content takes the pane's whole width rather than [ReadingWidth]: a grid of cards (an extension's dashboard page). */
     fullWidth: Boolean = false,
+    /** The list's scroll, so a tap spring can ignore a drag (`listTapScroll`). */
+    listScroll: NestedScrollConnection? = null,
     content: LazyListScope.() -> Unit,
 ) {
     val style = PersonaTheme.style
     val large = largeTitle && style != AppStyle.Board
+    // iOS keeps this title inline (InboxView.swift:152-153). Ending a selection inserts nothing and
+    // does not shift the list (the same withAnimation as the row close, :632). The large title just
+    // appears; rows spring only when the tap changed their order.
     val collapsed by remember(state, large) { derivedStateOf { !large || state.firstVisibleItemIndex > 0 || state.firstVisibleItemScrollOffset > 120 } }
     val barSubtitle = if (style == AppStyle.Board) subtitle ?: summary else null
     AdaptiveListProbe(page = title, state = state)
@@ -540,13 +564,16 @@ fun JListPage(
         val pad = pagePadding
         val bottom = padding.calculateBottomPadding()
         val viewport = if (scrollUnderBottom) Modifier.fillMaxSize() else Modifier.fillMaxSize().padding(bottom = bottom)
+        val scrolled = if (listScroll == null) viewport else viewport.nestedScroll(listScroll)
         val list: @Composable () -> Unit = {
             LazyColumn(
-                viewport, state,
+                scrolled, state,
                 contentPadding = PaddingValues(start = pad, end = pad, top = padding.calculateTopPadding() + 4.dp.dense,
                     bottom = if (scrollUnderBottom) bottom + Tokens.Space.section else Tokens.Space.section),
             ) {
-                if (large) item("page-title", contentType = "page-title") { PageTitle(title, subtitle, summary, greet, titleBusy, onTitleClick) }
+                if (large) item("page-title", contentType = "page-title") {
+                    PageTitle(title, subtitle, summary, greet, titleBusy, onTitleClick)
+                }
                 content()
             }
         }
@@ -567,11 +594,14 @@ fun JListPage(
 }
 
 @Composable
-private fun PageTitle(title: String, subtitle: String?, summary: String?, greet: Boolean, busy: Boolean, onClick: (() -> Unit)?) {
+private fun PageTitle(
+    title: String, subtitle: String?, summary: String?, greet: Boolean, busy: Boolean, onClick: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+) {
     val palette = PersonaTheme.palette
     val type = PersonaTheme.type
     val click = if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier
-    Column(Modifier.fillMaxWidth().padding(top = Tokens.Space.s, bottom = Tokens.Space.m)) {
+    Column(modifier.fillMaxWidth().padding(top = Tokens.Space.s, bottom = Tokens.Space.m)) {
         when (PersonaTheme.style) {
             AppStyle.Brief -> if (summary != null) {
                 if (greet) Text(todayLabel(), style = type.caption, color = palette.ink3)

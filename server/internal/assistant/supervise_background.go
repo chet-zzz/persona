@@ -26,6 +26,9 @@ import (
 // always had, a switch of the setting moves every open task at once, and a background supervisor that is gone leaves
 // no task naming a conversation that does not exist. Who gets a task's signals is decided when they are sent
 // (ownSupervisor), and what the background supervisor may do to a task follows the same rule (backgroundSupervises).
+//
+// Each of its rounds starts from its first turn, with only that round's facts and tools (#7315, supervise_round.go),
+// unless assistant.background_supervisor_keeps_context is on.
 
 // purposeSupervise is the model purpose the background supervisor runs under; it inherits the main chat's.
 const purposeSupervise = "assistant.supervise"
@@ -36,9 +39,11 @@ const purposeSupervise = "assistant.supervise"
 var backgroundGrace, backgroundRetry = 2 * time.Minute, 10 * time.Minute
 
 // backgroundBook holds the background supervisor's start still: one at a time, and not again right after a failure.
+// rounds is what its rounds' answers said (supervise_round.go), under its own lock.
 type backgroundBook struct {
 	mu       sync.Mutex
 	failedAt time.Time
+	rounds   superviseRounds
 }
 
 // backgroundOn: the background supervisor is on with settings cfg (assistant.main_supervises_own_tasks is not on).
@@ -75,11 +80,15 @@ func (s *Service) isBackground(ctx context.Context, id string) bool {
 // supervised task whose ledger names no current leader conversation and no task leader's agent. It may review it,
 // change its scope, answer and escalate its cards and speak to its agent as the task's own supervisor does.
 func (s *Service) backgroundSupervises(ctx context.Context, self string, t Todo) bool {
-	if t.Origin == "" || t.Supervision == nil || !s.isBackground(ctx, self) {
+	if t.Origin == "" || t.Supervision == nil || !s.isBackgroundSession(ctx, self) {
 		return false
 	}
 	sup := t.Supervision.Supervisor
-	return !s.isLeader(ctx, sup) && !s.isLeaderRef(sup)
+	if s.isLeaderRef(sup) {
+		return false
+	}
+	// A leader conversation on a runtime without supervision_policy cannot be told anything (digestTarget): its tasks are this route's to review.
+	return !s.isLeader(ctx, sup) || s.runtimeWithoutSupervisionPolicy(ctx, s.settings(ctx).MachineID, sup)
 }
 
 // followUpWords tells conversation self, in the answer of the tool that just made an agent its supervised task
@@ -97,8 +106,9 @@ func (s *Service) followUpWords(ctx context.Context, self string) string {
 // ensureBackground is the background supervisor to send to now, made if there is none yet or the one there was is
 // gone; "" while it is off, there is no main conversation or machine, or it cannot start (its tasks' signals then go
 // to the main conversation, and the start is tried again after backgroundRetry). gone is the one it found gone (on
-// another machine than the assistant's now, or no longer listed), whose queued message the caller takes back
-// (backgroundLost).
+// another machine than the assistant's now, or no longer listed), or the one it replaced because its rounds can no
+// longer start from its first turn (backgroundOutgrown, supervise_round.go), whose queued message the caller takes
+// back (backgroundLost).
 func (s *Service) ensureBackground(ctx context.Context) (id, gone string) {
 	b := &s.background
 	b.mu.Lock()
@@ -109,6 +119,11 @@ func (s *Service) ensureBackground(ctx context.Context) (id, gone string) {
 	}
 	if id := s.ownSupervisor(cfg); id != cfg.Main {
 		if s.backgroundThere(ctx, cfg, id) {
+			if why := s.backgroundOutgrown(ctx, cfg, id); why != "" {
+				if next := s.replaceBackground(ctx, cfg, id, why); next != id {
+					return next, id
+				}
+			}
 			return id, ""
 		}
 		s.logf("supervise: the background supervisor %s is gone from %s", short(id), cfg.MachineID)
@@ -126,6 +141,12 @@ func (s *Service) ensureBackground(ctx context.Context) (id, gone string) {
 		return "", gone
 	}
 	b.failedAt = time.Time{}
+	b.rounds.mu.Lock()
+	b.rounds.forks = nil
+	b.rounds.forksLoaded = true
+	b.rounds.breaker = superviseBreaker{}
+	b.rounds.mu.Unlock()
+	s.saveBackgroundForks(ctx, nil)
 	return id, gone
 }
 
@@ -134,7 +155,10 @@ func (s *Service) ensureBackground(ctx context.Context) (id, gone string) {
 // again where they go now, and that message is dropped. When the signals are not known (the manager restarted since it
 // was queued: supervise.queued is memory only, the deduplication history is not) the message itself moves to
 // conversation to, the new background supervisor or the main conversation, as do the other messages that waited
-// there: nothing queued is dropped unread. dedupMu is held.
+// there: nothing queued is dropped unread. A hand-over of the owner's words among them follows its message, and with no
+// conversation to move to it is not delivered (relay_handover.go). A background supervisor reserved for its
+// replacement (backgroundOutgrown) takes messages again from here: it is no longer the background supervisor, and
+// nothing waits for it. dedupMu is held.
 func (s *Service) backgroundLost(ctx context.Context, old, to, web string) []superviseSignal {
 	if old == "" || old == to {
 		return nil
@@ -145,22 +169,49 @@ func (s *Service) backgroundLost(ctx context.Context, old, to, web string) []sup
 	b.setQueuedLocked(old, nil)
 	b.mu.Unlock()
 	moved := 0
+	title := "" // the name of to, for a hand-over of the owner's words that moves there (relay_handover.go)
+	if to != "" {
+		title = short(to)
+		if cfg := s.settings(ctx); cfg.MachineID != "" {
+			if c, ok := s.session(ctx, cfg.MachineID, to); ok {
+				title = conversationName(c, cfg.Main)
+			}
+		}
+	}
+	h := &s.handovers
+	h.mu.Lock() // before the relay lock (handoverBook): the hand-overs change before the queue that moves them is saved
 	r := &s.relays
 	r.mu.Lock()
 	if s.relayLocked(ctx) && len(r.st.Queue[old]) > 0 && !r.draining[old] {
+		var handovers []string
 		for _, msg := range r.st.Queue[old] {
 			if msg.Tool == superviseTool && len(lost) > 0 {
 				continue // told again from its signals
 			}
+			if msg.Handover != "" {
+				handovers = append(handovers, msg.Handover)
+			}
 			if to != "" {
-				r.st.Queue[to] = append(r.st.Queue[to], msg)
+				msg.OnceID = ""                                                     // another destination is a separate delivery
+				msg.TriedAt, msg.Looks, msg.LookAfter = time.Time{}, 0, time.Time{} // the earlier try was to another conversation
 				moved++
+			}
+		}
+		s.handoversMovedLocked(handovers, to, title)
+		if to != "" {
+			for _, msg := range r.st.Queue[old] {
+				if msg.Tool == superviseTool && len(lost) > 0 {
+					continue
+				}
+				r.st.Queue[to] = append(r.st.Queue[to], msg)
 			}
 		}
 		delete(r.st.Queue, old)
 		s.saveRelayLocked()
 	}
+	delete(r.replacing, old)
 	r.mu.Unlock()
+	h.mu.Unlock()
 	if moved > 0 {
 		s.logf("supervise: %d message(s) queued for the background supervisor %s, which is gone, wait for %s now", moved, short(old), short(to))
 		if cfg := s.settings(ctx); cfg.MachineID != "" {
@@ -232,7 +283,7 @@ func (s *Service) backgroundThere(ctx context.Context, cfg Settings, id string) 
 		return true
 	}
 	if res.OK {
-		return res.Session.Assistant && !s.backgroundSignedOut(cfg, res.Session)
+		return res.Session.Assistant && !runtimeSessionLacksSupervisionPolicy(res.Session) && !s.backgroundSignedOut(cfg, res.Session)
 	}
 	if d, ok := s.device(ctx, cfg.MachineID); !ok || !d.Online || !d.Reachable {
 		return true
@@ -244,7 +295,7 @@ func (s *Service) backgroundThere(ctx context.Context, cfg Settings, id string) 
 	listed := false // the node listed since this manager started: an assistant conversation is in its list
 	for _, c := range list {
 		if c.SessionID == id {
-			return c.Assistant && !s.backgroundSignedOut(cfg, c)
+			return c.Assistant && !runtimeSessionLacksSupervisionPolicy(c) && !s.backgroundSignedOut(cfg, c)
 		}
 		listed = listed || c.Assistant
 	}
@@ -296,11 +347,11 @@ func (s *Service) startBackground(ctx context.Context) (string, error) {
 }
 
 // backgroundNeeded: one of the signals list would go to the background supervisor if there were one (digestTo).
-func (s *Service) backgroundNeeded(cfg Settings, list []superviseSignal) bool {
+func (s *Service) backgroundNeeded(ctx context.Context, cfg Settings, list []superviseSignal) bool {
 	const probe = "\x00background"
 	cfg.BackgroundSupervisor, cfg.BackgroundSupervisorMachineID = probe, cfg.MachineID
 	for _, g := range list {
-		if _, handled, _ := s.leaderRoute(g); !handled && s.digestTo(cfg, g) == probe {
+		if _, handled, _ := s.leaderRoute(g); !handled && s.digestTarget(ctx, cfg, g) == probe {
 			return true
 		}
 	}
@@ -312,7 +363,7 @@ func (s *Service) backgroundNeeded(cfg Settings, list []superviseSignal) bool {
 // the purpose cannot be resolved: the conversation then goes on with what it ran last.
 func (s *Service) backgroundModel(ctx context.Context, params map[string]any) {
 	p := maps.Clone(params)
-	if err := s.applyModel(ctx, purposeSupervise, p); err != nil {
+	if err := preservePermissionMode(p, func() error { return s.applyModel(ctx, purposeSupervise, p) }); err != nil {
 		s.logf("supervise: the background supervisor's model: %v; it keeps what it ran last", err)
 		return
 	}

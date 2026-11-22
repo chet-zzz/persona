@@ -65,10 +65,11 @@ type inboxBook struct {
 	held      map[string]inboxHeld // by source: the new items its last collection held back (inbox_admit.go)
 	// readErrs: the sources the last round could not read, by id, as a short code (assistantwire.ReadFailed…): the
 	// apps say which one is behind (InboxTriage.Sources). mailReadErrs: the same of the mail accounts the last mail
-	// round could not read, by account id. Memory only.
-	readErrs     map[string]string
-	mailReadErrs map[string]assistantwire.InboxMailFailed
-	grouping     inboxGrouping // the batches being related to events (inbox_group.go)
+	// round could not read, by account id, after the transient-failure grace rounds. Memory only.
+	readErrs         map[string]string
+	mailReadErrs     map[string]assistantwire.InboxMailFailed
+	mailReadFailures map[string]int // consecutive failed mail rounds, capped at mailNoticeFailures
+	grouping         inboxGrouping  // the batches being related to events (inbox_group.go)
 	// mailAsked: when the mail of an open mail item off its account's page was last looked up (inbox_mail_off_page.go),
 	// by item id, under mu: the lookups take the longest unasked first. Memory only.
 	mailAsked map[string]time.Time
@@ -84,7 +85,7 @@ type inboxBook struct {
 	// answer since, and when the next may go out (retryRuled). Memory only, under mu.
 	ruledFails   int
 	ruledRetryAt time.Time
-	// mailBaselines: by mail account id, the newest UID when the inbox first read it (inbox_mail.go mailBaseline),
+	// mailBaselines: by mail folder key, the baseline, UIDVALIDITY and generation (inbox_mail.go mailBaseline),
 	// stored (inboxMailBaselinesKey) when dirty. Under mu.
 	mailBaselines      map[string]uint32
 	mailBaselinesDirty bool

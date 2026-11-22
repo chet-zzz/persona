@@ -20,6 +20,9 @@ vi.mock("../../lib/ops", () => ({
 import { InteractionCard } from "./Interactions";
 import { getState } from "../../lib/store";
 import type { Interaction, Session } from "../../lib/types";
+import { loadPages } from "../../lib/lazy-page";
+
+await loadPages();
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -111,7 +114,7 @@ describe("a card answering from the keyboard", () => {
 
   it("Esc goes back to the composer and answers nothing", async () => {
     const composer = document.createElement("main");
-    composer.innerHTML = '<div data-chat-dock><textarea></textarea></div>';
+    composer.innerHTML = '<div data-chat-dock><textarea data-composer-input></textarea></div>';
     document.body.append(composer);
     act(() => root.render(<InteractionCard ix={permission} />));
     act(() => cardRoot().focus());

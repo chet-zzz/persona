@@ -54,7 +54,7 @@ func TestSupervisionPRConflictDedupKeepsPermanentEntriesDuringOrdinaryExpiry(t *
 	ctx, now := context.Background(), time.Now()
 	e := prompts.SuperviseEntry{ID: "todo_example", Last: "No task delivery yet."}
 	conflict := superviseSignal{Todo: e.ID, Kind: sigPRConflict, Key: "https://github.com/example/app/pull/12@head-a"}
-	idle := superviseSignal{Todo: e.ID, Kind: sigIdle, Key: "turn-a"}
+	idle := superviseSignal{Todo: e.ID, Kind: sigNeedsYou, Key: "turn-a"} // a kind that keeps the short window (keptUntilChange)
 	for _, g := range []superviseSignal{conflict, idle} {
 		if _, _, _, err := s.reserveSupervision(ctx, []prompts.SuperviseEntry{e}, []superviseSignal{g}, now); err != nil {
 			t.Fatal(err)
@@ -113,6 +113,71 @@ func TestSupervisionPRConflictAndAllStoppedDedupHaveIndependentLifetimes(t *test
 	}
 	if seen, exists := history[conflictKey]; !exists || !seen.Permanent || seen.Todo != "" {
 		t.Fatalf("all-stopped pruning removed or changed conflict history: %+v", history)
+	}
+}
+
+func TestSupervisionAutomaticSummaryDedupPrunesClosedTasks(t *testing.T) {
+	ctx, now := context.Background(), time.Now()
+	st := &memStore{}
+	s, _ := newQuietServiceOn(t, st)
+	task, _ := stoppedFixture(now)
+	open := task
+	open.ID += "_open"
+	signals := []superviseSignal{
+		{Todo: task.ID, Kind: sigParkedSummary, Key: now.Format(time.DateOnly) + "|dependency", To: "supervisor"},
+		{Todo: open.ID, Kind: sigParkedSummary, Key: now.Format(time.DateOnly) + "|dependency", To: "supervisor"},
+	}
+	entries := []prompts.SuperviseEntry{{ID: task.ID, Kind: sigParkedSummary}, {ID: open.ID, Kind: sigParkedSummary}}
+	if out, _, _, err := s.reserveSupervision(ctx, entries, signals, now); err != nil || len(out) != 2 {
+		t.Fatalf("initial summary reservation = %d, %v", len(out), err)
+	}
+	restarted, _ := newQuietServiceOn(t, st)
+	if out, _, _, err := restarted.reserveSupervision(ctx, entries, signals, now.Add(time.Hour)); err != nil || len(out) != 0 {
+		t.Fatalf("restart or ordinary expiry repeated daily summaries: %d, %v", len(out), err)
+	}
+	if err := restarted.ensureTodosLoaded(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restarted.todos.mu.Lock()
+	restarted.todos.todos[task.ID] = &task
+	restarted.todos.todos[open.ID] = &open
+	restarted.todos.mu.Unlock()
+	restarted.pruneAllStoppedDedup(ctx)
+	restarted.todos.mu.Lock()
+	task.DoneAt = &now
+	restarted.todos.mu.Unlock()
+	restarted.pruneAllStoppedDedup(ctx)
+
+	var history map[string]superviseFingerprint
+	if _, err := st.Setting(ctx, superviseDedupKey, &history); err != nil {
+		t.Fatal(err)
+	}
+	closedKey, _ := digestFingerprint(entries[0], signals[0])
+	openKey, _ := digestFingerprint(entries[1], signals[1])
+	if _, exists := history[closedKey]; exists {
+		t.Fatal("closed task retained its automatic-summary fingerprint")
+	}
+	if seen, exists := history[openKey]; !exists || !seen.Permanent || seen.Todo != open.ID {
+		t.Fatalf("pruning removed or unbound the open task's daily summary: %+v", history)
+	}
+	// Re-read a legacy receipt that predates task binding; it must not leak forever after closure either.
+	history[closedKey] = superviseFingerprint{Hash: now.Format(time.DateOnly), At: now, Permanent: true}
+	if err := st.PutSetting(ctx, superviseDedupKey, history); err != nil {
+		t.Fatal(err)
+	}
+	restarted.supervise.dedupMu.Lock()
+	restarted.supervise.dedup = nil
+	restarted.supervise.dedupMu.Unlock()
+	restarted.pruneAllStoppedDedup(ctx)
+	history = nil
+	if _, err := st.Setting(ctx, superviseDedupKey, &history); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := history[closedKey]; exists {
+		t.Fatal("closed task retained its legacy automatic-summary fingerprint")
+	}
+	if _, exists := history[openKey]; !exists {
+		t.Fatal("legacy cleanup removed an open task's summary")
 	}
 }
 

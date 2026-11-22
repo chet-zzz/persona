@@ -12,6 +12,7 @@ import (
 	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/rpc"
+	"github.com/nwverse/persona/server/internal/textfmt"
 	"github.com/nwverse/persona/server/internal/transcript"
 )
 
@@ -99,6 +100,9 @@ type healthResult struct {
 	// resetsAt: a usage limit's reset as the outcome's source knew it (an agent's own record of the limit); nil: read
 	// off err's words when they name a time zone.
 	resetsAt *time.Time
+	// at: when the outcome happened, when that was before it is recorded (an agent's turn whose usage limit has no
+	// known reset: its transcript's time, launcherLimitTurnSettled); zero: now. The record's evidence is that old.
+	at time.Time
 	// observed is the record as read before a probe (nil: not a probe's result); a later version of it (another check
 	// time or rev) makes that probe's result obsolete.
 	observed *LauncherHealth
@@ -108,8 +112,8 @@ type healthResult struct {
 const (
 	healthSourceCheck = "check" // launchers.check, in the node's login shell
 	healthSourceStart = "start" // an agent's start, in a terminal tab
-	// healthSourceSession: an agent's own turn with the launcher ended on the subscription's usage limit, its reset
-	// known (launcherLimitTurnEnded). Nothing was run for it: no check, no repair.
+	// healthSourceSession: an agent's own turn with the launcher ended on the subscription's usage limit
+	// (launcherLimitTurnEnded). Nothing was run for it: no check, no repair.
 	healthSourceSession = "session"
 )
 
@@ -130,10 +134,16 @@ func (s *Service) recordHealth(ctx context.Context, machine, launcher string, r 
 	key := healthKey(machine, launcher)
 	rec := b.recs[key]
 	limited := rec != nil && rec.Kind == errKindUsageLimit && rec.unusable()
+	// The raw error is what the terminal or the CLI printed, colour, prompt marks and shell startup noise included:
+	// clean it once, before anything reads its words (the classification among them).
+	cleanErr := r.err
+	if cleanErr != "" {
+		cleanErr = textfmt.LauncherErrorSummary(cleanErr, 400)
+	}
 	kind := ""
 	if !r.ok {
 		if kind = r.kind; kind == "" {
-			kind = classifyLauncherError(r.err)
+			kind = classifyLauncherError(cleanErr)
 		}
 	}
 	keep := func(changed bool) LauncherHealth {
@@ -150,8 +160,12 @@ func (s *Service) recordHealth(ctx context.Context, machine, launcher string, r 
 		return out
 	}
 	now := time.Now().UTC()
+	at := now // when r happened (healthResult.at)
+	if !r.at.IsZero() && r.at.Before(now) {
+		at = r.at.UTC()
+	}
 	if o := r.observed; o != nil && (rec == nil && !o.CheckedAt.IsZero() || rec != nil && (!rec.CheckedAt.Equal(o.CheckedAt) || rec.rev != o.rev)) {
-		return keep(limited && kind == errKindUsageLimit && foldLimit(rec, limitFamilies(r.err), limitResetOf(r, now)))
+		return keep(limited && kind == errKindUsageLimit && foldLimit(rec, limitFamilies(cleanErr), limitResetOf(r, now)))
 	}
 	if limited && !r.ok && kind != errKindUsageLimit {
 		return keep(false)
@@ -181,7 +195,10 @@ func (s *Service) recordHealth(ctx context.Context, machine, launcher string, r 
 		// start says otherwise (#1642): a session already running says nothing of a new terminal tab.
 		return keep(false)
 	}
-	rec.CheckedAt, rec.Source, rec.Millis = now, r.source, r.millis
+	rec.CheckedAt, rec.Source, rec.Millis = at, r.source, r.millis
+	if limited && old.CheckedAt.After(at) {
+		rec.CheckedAt = old.CheckedAt // folded into a limit with newer evidence: its evidence is still that new
+	}
 	if r.agent != "" {
 		rec.Agent = r.agent
 	}
@@ -192,12 +209,12 @@ func (s *Service) recordHealth(ctx context.Context, machine, launcher string, r 
 		rec.Model = r.model
 	} else {
 		rec.Fails++
-		if missingCode(r.err) == proto.CodeClaudeMissing {
+		if missingCode(cleanErr) == proto.CodeClaudeMissing {
 			rec.MissingFails++
 		} else {
 			rec.MissingFails = 0
 		}
-		rec.Error = clip(oneLine(r.err), 400)
+		rec.Error = clip(oneLine(cleanErr), 400)
 		rec.Kind = kind
 		switch {
 		case rec.Kind == errKindNotInTerminal:
@@ -210,7 +227,7 @@ func (s *Service) recordHealth(ctx context.Context, machine, launcher string, r 
 			if limited {
 				merged = old
 			}
-			foldLimit(&merged, limitFamilies(r.err), limitResetOf(r, now))
+			foldLimit(&merged, limitFamilies(cleanErr), limitResetOf(r, at))
 			rec.LimitModels, rec.LimitResets, rec.ResetsAt = merged.LimitModels, merged.LimitResets, merged.ResetsAt
 		case rec.State == "" || rec.State == healthOK:
 			rec.State = healthFailing
@@ -244,7 +261,7 @@ func (s *Service) setHealthState(ctx context.Context, machine, launcher, state, 
 		rec.State = state
 	}
 	if state == healthBlocked {
-		rec.BlockedReason = clip(oneLine(why), 600)
+		rec.BlockedReason = clip(oneLine(textfmt.StripTerminalEscapes(why)), 600)
 	}
 	if fixed != nil {
 		f := *fixed
@@ -289,7 +306,7 @@ func (s *Service) healthChanged(ctx context.Context, r LauncherHealth, before st
 // about launcher health. Other failures count, with one shared follow-up check to tell a blink from a broken launcher.
 // A terminal-shell failure (errKindNotInTerminal) skips the check: the login shell is where the launcher already works.
 func (s *Service) recordStartFailure(ctx context.Context, machine, launcher string, err error) {
-	if err == nil || launcher == "" || transientStartErr(err) || errors.Is(err, ErrNoDevice) || startRefused(err) || startStalled(err) {
+	if err == nil || launcher == "" || proto.IsExternalLauncher(launcher) || transientStartErr(err) || errors.Is(err, ErrNoDevice) || startRefused(err) || startStalled(err) {
 		return
 	}
 	if startWaitEnded(err) {
@@ -387,10 +404,11 @@ func limitResetOf(r healthResult, at time.Time) *time.Time {
 }
 
 // launcherLimitTurnEnded: a turn of machine's session sid ended. When it ended on the subscription's usage limit,
-// with a reset still ahead, the launcher the session names counts as usage-limited on machine until then (source
-// healthSourceSession): an agent started with it there would be refused at once too. Nothing runs for it, no check
-// (it would spend a request to be refused) and no repair. The assistant's conversations count as well: the main
-// chat runs the machine's launcher under the same sign-in, so its limit is the launcher's.
+// the launcher the session names counts as usage-limited on machine (source healthSourceSession): until the reset
+// when it is known and still ahead, else until healthStale after the turn (#9646). An agent started with it there
+// would be refused at once too. Nothing runs for it, no check (it would spend a request to be refused) and no repair.
+// The assistant's conversations count as well: the main chat runs the machine's launcher under the same sign-in, so
+// its limit is the launcher's.
 func (s *Service) launcherLimitTurnEnded(ctx context.Context, machine, sid string) {
 	// Once the turn stayed still, as a task's end is judged (settleDelay): right after a write the node's list may not
 	// have read the transcript yet (its meta is read again at most every few seconds), and says no error meanwhile.
@@ -411,17 +429,38 @@ func (s *Service) launcherLimitTurnSettled(ctx context.Context, machine, sid str
 		return
 	}
 	lim := limitOfTurn(sess)
-	reset, ok := usageLimitReset(lim)
-	if now := time.Now(); !ok || !reset.After(now) || reset.Sub(now) > healthLimitMax {
+	if lim.TurnErrorKind != proto.TurnErrorUsageLimit || lim.TurnError == "" {
 		return
+	}
+	now := time.Now()
+	res := healthResult{err: lim.TurnError, source: healthSourceSession, kind: errKindUsageLimit}
+	if reset, ok := usageLimitReset(lim); ok && reset.Sub(now) <= healthLimitMax {
+		if !reset.After(now) {
+			return // the limit it met is over
+		}
+		res.resetsAt = &reset
+	} else {
+		// No reset known, or one too far off to be read right (limitResetOf): the turn's families are limited with an
+		// unknown reset (#9646), and its evidence is as old as the turn. It goes stale as any failure without a reset
+		// does, healthStale after the turn: a turn the hub reads late says that much less of the quota now, and one
+		// older than that says nothing.
+		res.at = lim.UpdatedAt
+		if res.at.IsZero() || res.at.After(now) {
+			res.at = now
+		}
+		if now.Sub(res.at) >= healthStale {
+			return
+		}
 	}
 	// Nothing new for the limit in force (foldLimit changes nothing on the families the turn names): each turn a
-	// background task wakes meets it again, and refreshing the evidence would hold off the next probe.
+	// background task wakes meets it again, and refreshing the evidence would hold off the next probe. A turn with no
+	// reset known is new while the record's evidence is stale (another family's known reset holds it,
+	// familyResetAhead): the turn's families hold on that evidence alone.
 	if r, found := s.launcherHealth(ctx, machine, sess.Launcher); found && r.Kind == errKindUsageLimit && r.unusable() &&
-		!foldLimit(&r, limitFamilies(lim.TurnError), &reset) {
+		!foldLimit(&r, limitFamilies(lim.TurnError), res.resetsAt) && (res.resetsAt != nil || time.Since(r.CheckedAt) < healthStale) {
 		return
 	}
-	s.recordHealth(ctx, machine, sess.Launcher, healthResult{err: lim.TurnError, source: healthSourceSession, kind: errKindUsageLimit, resetsAt: &reset})
+	s.recordHealth(ctx, machine, sess.Launcher, res)
 }
 
 // limitOfTurn is sess's latest turn error decorated with what it says of a usage limit (decorateLimit): the node's
@@ -457,7 +496,7 @@ var startRequestErr = lazyre.New(`^directory .* does not exist$|^invalid launche
 // An engine with no provider of the launcher's kind (launcher_kind_missing, #8140) is the request's: the launcher is
 // not broken, and its check, which runs it on the command line, would pass and clear any record of it.
 var startRefusalCodes = []string{"codex_needs_prompt", "codex_resume", "codex_read_only", "orca_resume", "open_elsewhere", "runtime_session",
-	"identity_conflict", "ultracode_unsupported", "readonly_unsupported", proto.CodeDirectoryUntypable, proto.CodeNodeOutdated,
+	proto.CodeResumeUnknown, "identity_conflict", "ultracode_unsupported", "readonly_unsupported", proto.CodeDirectoryUntypable, proto.CodeNodeOutdated,
 	proto.CodeLauncherKindMissing}
 
 // startRefused: the start failed on the request, not the launcher: the node checked it and said no before running

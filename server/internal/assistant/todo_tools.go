@@ -19,7 +19,8 @@ import (
 // not a task) are created, changed, completed and reopened at once; deleting one is confirmed on the phone every time,
 // and so is completing or reopening a task or a todo agents work on (completing it closes its agents, tasks_close.go). A
 // health conversation asks before anything leaves its space (confirmOutbound). Plain todos only: work for an agent
-// still goes through task_plan.
+// still goes through task_plan. With manager.json's assistant.complete_agentless_todos enabled, a conversation can
+// complete its own agentless memo without the extra card; every other boundary stays the same (#11371).
 
 // The tools' descriptions and arguments are in prompts/mcp/todo (todo_list … todo_delete; tools.go lists them).
 
@@ -160,7 +161,11 @@ func (s *Service) toolTodoGet(ctx context.Context, machine, self string, args js
 	var b strings.Builder
 	b.WriteString(todoLine(t, now, loc) + "\n")
 	fmt.Fprintf(&b, "created %s, updated %s\n", t.CreatedAt.In(loc).Format(toolTimeLayout), t.UpdatedAt.In(loc).Format(toolTimeLayout))
-	if t.DoneAt != nil {
+	if t.failedStart() {
+		// Stored done (#1077), but nothing was done: it is open and waits on the owner, as the app shows it (#10365).
+		fmt.Fprintf(&b, "did not start %s: not done, it still waits on the owner; task_retry starts it again (optionally with "+
+			"another launcher), or task_plan with this todo_id takes it up\n", t.DoneAt.In(loc).Format(toolTimeLayout))
+	} else if t.DoneAt != nil {
 		fmt.Fprintf(&b, "done %s", t.DoneAt.In(loc).Format(toolTimeLayout))
 		if t.DoneBy != "" {
 			fmt.Fprintf(&b, " (by %s: %s)", t.DoneBy, clip(oneLine(t.DoneReason), 200))
@@ -207,6 +212,13 @@ func (s *Service) toolTodoGet(ctx context.Context, machine, self string, args js
 			}
 			b.WriteString("\n")
 		}
+	}
+	if t.Responsible != nil {
+		fmt.Fprintf(&b, "responsible: %s %q", t.Responsible.Kind, clip(oneLine(t.Responsible.Name), 120))
+		if hints := formatResponsibleHints(t.Responsible); hints != "" {
+			fmt.Fprintf(&b, " (%s)", hints)
+		}
+		b.WriteString("\n")
 	}
 	if len(t.Agents) > 0 {
 		b.WriteString("agents:\n")
@@ -276,6 +288,9 @@ func (s *Service) toolTodoCreate(ctx context.Context, machine, self string, args
 	bindings, err := parseCreateBindings(a.RepositoryBindings)
 	if err != nil {
 		return "", err
+	}
+	if err := s.resolveCreateBindings(ctx, bindings); err != nil { // before the store, outside todos.writing
+		return "", s.taskRepositoryToolError(ctx, err)
 	}
 	title := strings.TrimSpace(a.Title)
 	if title == "" {
@@ -449,7 +464,10 @@ func (s *Service) toolTodoDone(ctx context.Context, machine, self, name string, 
 	if complete && t.isConcern() {
 		return "", fmt.Errorf("%s is a concern: it closes only when you report its outcome to the user with concern_report", t.ID)
 	}
-	if todoHasWork(t) {
+	supervisor := supervisorOf(t)
+	direct := complete && self != "" && t.PlanID == "" && s.hello(ctx).Assistant.CompleteAgentlessTodos && !todoHasAgents(t) &&
+		(supervisor == self || supervisor == "" && t.Origin == self)
+	if todoHasWork(t) && !direct {
 		key := "assistant-todos.reopen_card"
 		if complete {
 			key = "assistant-todos.complete_card"
@@ -636,6 +654,9 @@ func todoLine(t Todo, now time.Time, loc *time.Location) string {
 	}
 	if active > 0 {
 		fmt.Fprintf(&b, " · %d agent(s) on it", active)
+	}
+	if t.Responsible != nil {
+		fmt.Fprintf(&b, " · responsible %s: %s", t.Responsible.Kind, clip(oneLine(t.Responsible.Name), 80))
 	}
 	return b.String()
 }

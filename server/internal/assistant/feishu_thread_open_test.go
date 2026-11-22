@@ -81,7 +81,7 @@ func TestTopicRootOpensATodo(t *testing.T) {
 	}
 
 	notes := topicNotes(e.f)
-	want := e.said("thread_open_done", i18n.Args{"title": todo.Title}) + "\nhttps://hub.example.com/todos?id=" + todo.ID
+	want := e.said("thread_open_done", i18n.Args{"title": todo.Title}) + "\nhttps://hub.example.com/todos/" + todo.ID
 	if len(notes) != 1 || notes[0]["text"] != want || notes[0]["chat_id"] != testChat || notes[0]["in_thread"] != true || notes[0]["reply_to"] != "om_r1" {
 		t.Fatalf("notes %v, want %q into the topic as a reply", notes, want)
 	}
@@ -479,7 +479,7 @@ func TestOpenedLineLinksOnlyWithAWebAddress(t *testing.T) {
 			line := e.said("thread_open_done", i18n.Args{"title": "发版"})
 			want := line
 			if c.wantLink {
-				want += "\n" + strings.TrimRight(c.url, "/") + "/todos?id=" + todo.ID
+				want += "\n" + strings.TrimRight(c.url, "/") + "/todos/" + todo.ID
 			}
 			if got := lastNote(t, e.f); got != want {
 				t.Fatalf("note %q, want %q", got, want)
@@ -500,7 +500,7 @@ func TestPrivateChatNeverOpensATodoFromATopic(t *testing.T) {
 
 // withMentions puts mentions on ev: the bot as @_user_1 and a colleague as @_user_2 (named), @_user_3 (no name known).
 func withMentions(ev feishubot.MessageEvent) feishubot.MessageEvent {
-	ev.Message.Mentions = []feishubot.Mention{{Key: "@_user_1", Name: "示例机器人"}, {Key: "@_user_2", Name: "小王"}, {Key: "@_user_3"}}
+	ev.Message.Mentions = []feishubot.Mention{{Key: "@_user_1", Name: "示例机器人", ID: feishubot.UserID{OpenID: "ou_bot"}}, {Key: "@_user_2", Name: "小王"}, {Key: "@_user_3"}}
 	return ev
 }
 
@@ -527,6 +527,8 @@ func TestOpeningTakesOffTheBotsMention(t *testing.T) {
 		{"an @ with no name stays as it stands", "text", `{"text":"@_user_1 让 @_user_3 看登录崩溃"}`, true, "让 @_user_3 看登录崩溃"},
 		{"@_user_1 is not the start of @_user_10", "text", `{"text":"@_user_10 看登录崩溃"}`, true, "@_user_10 看登录崩溃"},
 		{"rich text, /ai after the @", postType, postBody, false, "修登录崩溃"},
+		{"rich text, adjacent /ai", postType, strings.Replace(postBody, " /ai", "/ai", 1), false, "修登录崩溃"},
+		{"rich text, adjacent /ai in a root", postType, strings.Replace(postBody, " /ai", "/ai", 1), true, "修登录崩溃"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e := newThreadEnv(t, nil)
